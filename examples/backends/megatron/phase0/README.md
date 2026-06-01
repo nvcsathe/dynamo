@@ -34,6 +34,12 @@ Three processes:
 - `uv sync --extra training` already run in the Megatron worktree so its
   `.venv` exists on the shared filesystem.
 
+## Interactive bring-up (recommended for first run)
+
+When iterating on the integration code, use `INTERACTIVE.md` instead of the
+sbatch — `salloc` + tmux lets you restart the worker / frontend without
+re-loading the 8B checkpoint.
+
 ## Submit
 
 ```bash
