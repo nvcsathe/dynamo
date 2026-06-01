@@ -102,3 +102,24 @@ trtllm:
   enable_media_ffmpeg: "false"
   enable_gpu_memory_service: "true"
   enable_kvbm: "true"
+
+megatron:
+  # Megatron-LM has no standalone runtime image — it installs into the NGC
+  # PyTorch container. Mirrors Megatron-LM/docker/.ngc_version.dev.
+  cuda12.9:
+    base_image: nvcr.io/nvidia/cuda-dl-base
+    runtime_image: nvcr.io/nvidia/pytorch
+    base_image_tag: 25.06-cuda12.9-devel-ubuntu24.04
+    runtime_image_tag: 26.04-py3
+  # Megatron's source repo + ref to clone at build time. Override
+  # `--build-arg MEGATRON_REPO=...` / `--build-arg MEGATRON_REF=...` to point
+  # at a fork or feature branch (e.g. the `feature/dynamo-streaming` branch
+  # carrying ENGINE_REPLY_PARTIAL).
+  megatron_repo: https://github.com/NVIDIA/Megatron-LM.git
+  megatron_ref: main
+  nixl_ref: 0.10.1
+  enable_media_ffmpeg: "false"
+  # Phase 0 does not use KVBM or the GPU memory service. Flip to "true" once
+  # the KV-events / disagg phases land.
+  enable_gpu_memory_service: "false"
+  enable_kvbm: "false"

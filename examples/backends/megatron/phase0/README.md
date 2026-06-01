@@ -31,8 +31,57 @@ Three processes:
 - HuggingFace tokenizer matching the Megatron tokenizer used at training time.
   The Dynamo frontend uses this tokenizer to convert prompts to token IDs
   before they hit the worker.
-- `uv sync --extra training` already run in the Megatron worktree so its
-  `.venv` exists on the shared filesystem.
+- Either: the **container image** below (recommended — one image with both
+  Megatron-LM and Dynamo baked in), OR a host venv where you've already run
+  `uv sync --extra training` in the Megatron worktree so its `.venv` exists
+  on the shared filesystem.
+
+## Container image (one image, both stacks baked in)
+
+The Dynamo container build supports `--framework megatron`, mirroring the
+trtllm and vllm images: NGC PyTorch base + Megatron-LM cloned at build time +
+Dynamo wheels + nats/etcd binaries. From the dynamo checkout root:
+
+```bash
+cd container
+
+# Render the Dockerfile (Megatron's pin: pytorch:26.04-py3 on cuda12.9).
+python render.py --framework megatron --target runtime \
+    --platform linux/arm64 --cuda-version 12.9 \
+    --output-short-filename
+
+# Build, pointing MEGATRON_REPO/MEGATRON_REF at the feature branch with the
+# streaming patches. Drop --build-arg overrides once they're merged upstream.
+docker buildx build \
+    --platform linux/arm64 \
+    --build-arg MEGATRON_REPO=https://github.com/<your-fork>/Megatron-LM.git \
+    --build-arg MEGATRON_REF=feature/dynamo-streaming \
+    -t dynamo-megatron:phase0 \
+    -f rendered.Dockerfile \
+    ..
+```
+
+For local Megatron development (changing the streaming protocol without
+pushing commits), build once at any ref then mount your live worktree over
+`/opt/megatron-lm` at run time:
+
+```bash
+docker run --rm -it --gpus all \
+    -v /path/to/local/Megatron-LM:/opt/megatron-lm \
+    -v /shared/models:/shared/models:ro \
+    --network host \
+    dynamo-megatron:phase0
+```
+
+The clone in the image stays as the fallback; the bind mount shadows it. Both
+the coordinator and the Dynamo worker live in this image — launch them as
+separate `docker run` invocations (or `srun` steps on Slurm, see below) all
+pointing at `dynamo-megatron:phase0`.
+
+## Submit
+
+```bash
+sbatch \
 
 ## Interactive bring-up (recommended for first run)
 

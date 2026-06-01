@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Third-party Python dependencies for the megatron runtime image. Installed
+# with --no-deps so upstream nvcr.io/nvidia/pytorch's solve stays intact.
+# Megatron-LM's own pyproject pulls the rest of its inference deps via
+# `uv pip install -e /opt/megatron-lm` in the Dockerfile.
+# Sorted alphabetically per pre-commit requirements-txt-fixer.
+
+# Megatron's InferenceClient wire protocol (DEALER↔ROUTER + per-step partial
+# replies for streaming). Megatron's pyproject lists pyzmq+msgpack but pins
+# them; we install them here at fixed lower bounds for the cases where the
+# NGC PyTorch base ships an older copy.
+msgpack>=1.0.7
+# Required by ai_dynamo_runtime.
+msgspec>=0.19.0
+pyzmq>=26.0.0
+# Tokenizer used by both the Dynamo frontend (when it sees the served-model-name)
+# and Megatron-LM's HuggingFaceTokenizer flag.
+transformers>=4.45.0
+# Required by ai_dynamo_runtime (companion to msgspec).
+uvloop>=0.21.0
