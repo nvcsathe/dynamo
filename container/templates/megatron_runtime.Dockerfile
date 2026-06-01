@@ -42,17 +42,21 @@ ARG MEGATRON_REF
 ARG TARGETARCH
 
 # DYNAMO_HOME points at /workspace so bundled scripts under
-# $DYNAMO_HOME/examples resolve.
+# $DYNAMO_HOME/examples resolve. Dynamo + Megatron-LM both install into
+# /opt/dynamo/venv (created below with --system-site-packages so upstream
+# PyTorch/CUDA libs stay importable) — the NGC PyTorch base ships PEP 668
+# system Python so we can't install into /usr directly.
 ENV DYNAMO_HOME=/workspace \
     HOME=/home/dynamo \
     MEGATRON_HOME=/opt/megatron-lm \
-    PATH=/usr/local/bin/etcd:${PATH} \
+    VIRTUAL_ENV=/opt/dynamo/venv \
+    PATH=/opt/dynamo/venv/bin:/usr/local/bin/etcd:${PATH} \
     PYTHONPATH=/opt/megatron-lm:${PYTHONPATH:-}
 
 WORKDIR /workspace
 
 # OS packages: git for the Megatron clone, openssh + rdma for downstream
-# multi-node bring-up later.
+# multi-node bring-up later, python3-venv so we can build /opt/dynamo/venv.
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
     apt-get update && \
@@ -60,17 +64,25 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         git \
         openssh-server \
         librdmacm1 \
-        rdma-core
+        rdma-core \
+        python3-venv
 
 # Pull nats-server, etcd, uv, uvx into their final paths.
 COPY --from=dynamo_base_export / /
+
+# Create the Dynamo venv with --system-site-packages so the upstream PyTorch
+# image's pinned torch/numpy/triton/cuda libs remain importable. Everything
+# below installs into this venv via uv pip (no --system flag).
+RUN mkdir -p /opt/dynamo \
+    && python3 -m venv --system-site-packages /opt/dynamo/venv \
+    && ln -sf /usr/bin/uv /opt/dynamo/venv/bin/uv
 
 # Clone Megatron-LM at the configured ref and install it editable so users
 # can later mount their own checkout over /opt/megatron-lm at `docker run`
 # time without rebuilding. --no-deps preserves the NGC PyTorch image's solve;
 # Megatron's own pyproject extras are layered on top below.
 RUN git clone --depth 1 --branch "${MEGATRON_REF}" "${MEGATRON_REPO}" /opt/megatron-lm \
-    && /usr/bin/uv pip install --system --no-deps -e /opt/megatron-lm
+    && uv pip install --no-deps -e /opt/megatron-lm
 
 # Megatron-Inference + the Dynamo backend's runtime dep set. Kept narrow
 # (msgpack + pyzmq for the wire protocol, msgspec/uvloop for ai-dynamo-runtime,
@@ -78,14 +90,14 @@ RUN git clone --depth 1 --branch "${MEGATRON_REF}" "${MEGATRON_REPO}" /opt/megat
 # perturb upstream PyTorch's pinned numpy/triton/etc.
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     --mount=type=bind,source=./container/deps/requirements.megatron.txt,target=/tmp/requirements.megatron.txt \
-    /usr/bin/uv pip install --system --no-deps --requirement /tmp/requirements.megatron.txt
+    uv pip install --no-deps --requirement /tmp/requirements.megatron.txt
 
-# Dynamo user (group 0 for OpenShift), reset upstream /workspace baggage,
-# stage /opt/dynamo.
+# Dynamo user (group 0 for OpenShift), reset upstream /workspace baggage.
+# /opt/dynamo was already created above to host the venv.
 RUN userdel -r ubuntu > /dev/null 2>&1 || true \
     && useradd -m -s /bin/bash -g 0 dynamo \
     && [ `id -u dynamo` -eq 1000 ] \
-    && mkdir -p /home/dynamo/.cache /opt/dynamo \
+    && mkdir -p /home/dynamo/.cache \
     && ln -sf /usr/bin/python3 /usr/local/bin/python \
     && rm -rf /workspace && mkdir /workspace \
     && chown dynamo:0 /home/dynamo /home/dynamo/.cache /opt/dynamo /workspace /opt/megatron-lm \
@@ -101,8 +113,8 @@ COPY --chmod=775 --chown=dynamo:0 --from=wheel_builder /opt/dynamo/dist/*.whl /o
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     export UV_CACHE_DIR=/root/.cache/uv && \
     # Dynamo wheels — --no-deps preserves upstream's solve.
-    /usr/bin/uv pip install --system --no-deps /opt/dynamo/wheelhouse/ai_dynamo_runtime*.whl && \
-    /usr/bin/uv pip install --system --no-deps /opt/dynamo/wheelhouse/ai_dynamo*any.whl
+    uv pip install --no-deps /opt/dynamo/wheelhouse/ai_dynamo_runtime*.whl && \
+    uv pip install --no-deps /opt/dynamo/wheelhouse/ai_dynamo*any.whl
 {% endif %}
 
 # Pull /workspace_src (incl. ATTRIBUTION/LICENSE) from the transport stage.
@@ -134,7 +146,8 @@ COPY --from=runtime_full / /
 ENV DYNAMO_HOME=/workspace \
     HOME=/home/dynamo \
     MEGATRON_HOME=/opt/megatron-lm \
-    PATH=/usr/local/bin/etcd:${PATH} \
+    VIRTUAL_ENV=/opt/dynamo/venv \
+    PATH=/opt/dynamo/venv/bin:/usr/local/bin/etcd:${PATH} \
     PYTHONPATH=/opt/megatron-lm:${PYTHONPATH:-}
 
 WORKDIR /workspace
