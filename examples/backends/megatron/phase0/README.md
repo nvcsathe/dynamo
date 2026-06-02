@@ -1,131 +1,149 @@
-# Megatron + Dynamo — Phase 0 Launcher
+# Megatron + Dynamo — Phase 0
 
 Brings up an 8B Megatron model behind a Dynamo worker on a single node with
 TP=2. Aggregated decode, token streaming. No KV events, no metrics, no
 disaggregated prefill / decode. Those land in later phases.
 
-## What this gives you
+Everything runs inside the `chaitrasathe/dynamo-megatron:phase0-arm64`
+container under enroot/pyxis. There is no bare-metal path.
 
-Three processes:
+## Files in this directory
 
-1. **Megatron coordinator + engine (rank 0..1):** `torchrun` launches
-   `tools/run_dynamic_text_generation_server.py --frontend dynamo`. The
-   coordinator binds a ZMQ ROUTER on `:5555` and prints
-   `MEGATRON_COORDINATOR_ADDR=tcp://<host>:5555` on stdout once ready.
-2. **Dynamo Megatron worker (no GPU):** `python -m dynamo.megatron` connects
-   to the coordinator address scraped from step 1, registers the model on
-   etcd, and serves the `dynamo.backend.generate` endpoint.
-3. **Dynamo frontend (external):** the HTTP/router process that sits in front
-   of `(2)`. **Not** brought up by this script — launch it separately on a
-   reachable host with the same NATS / etcd endpoints.
+| File | Role |
+|---|---|
+| `launch_phase0.sh` | Host wrapper. `srun`s into the container and invokes `orchestrate.sh`. |
+| `orchestrate.sh`   | Inside-container orchestrator. Brings up NATS + etcd + coordinator + worker + frontend, waits for health, writes `/tmp/phase0.env`, blocks until Ctrl-C. |
+| `test_phase0.sh`   | Curl smoke test against an already-up stack. |
+| `test_phase0.py`   | Pytest functional test against an already-up stack. |
+
+## What's in scope
+
+Five processes, all running inside one container:
+
+1. **NATS + etcd** — baked into the image, started first by `orchestrate.sh`.
+2. **Megatron coordinator + engine (rank 0..1):** `torchrun` launches
+   `tools/run_dynamic_text_generation_server.py --frontend dynamo`. Binds a
+   ZMQ ROUTER on `:5555` and prints
+   `MEGATRON_COORDINATOR_ADDR=tcp://<host>:5555` once ready.
+3. **Dynamo Megatron worker:** `python -m dynamo.megatron` connects to the
+   coordinator, registers the model on etcd, serves `dynamo.backend.generate`.
+4. **Dynamo frontend:** `python -m dynamo.frontend` — OpenAI-compatible HTTP
+   on `:8080`.
 
 ## Prerequisites
 
-- Megatron-LM checkout containing the `feature/dynamo-streaming` changes
-  (`ENGINE_REPLY_PARTIAL` header, `InferenceClient.add_request_streaming`,
-  `tools/run_dynamic_text_generation_server.py --frontend dynamo`).
-- Dynamo checkout containing this directory and `components/src/dynamo/megatron/`.
-- NATS + etcd already running on hosts reachable from the compute node.
-- 8B Megatron checkpoint (e.g. Llama-3.1-8B converted via Megatron tools) on a
-  shared filesystem.
-- HuggingFace tokenizer matching the Megatron tokenizer used at training time.
-  The Dynamo frontend uses this tokenizer to convert prompts to token IDs
-  before they hit the worker.
-- Either: the **container image** below (recommended — one image with both
-  Megatron-LM and Dynamo baked in), OR a host venv where you've already run
-  `uv sync --extra training` in the Megatron worktree so its `.venv` exists
-  on the shared filesystem.
+- The container image (`chaitrasathe/dynamo-megatron:phase0-arm64`) built and
+  imported under enroot — see "Building the image" below.
+- 8B Megatron checkpoint (e.g. Llama-3.1-8B converted via Megatron-Bridge) on
+  lustre at `$STAGE/models/Llama-3.1-8B-mcore`. See conversion notes in the
+  parent `README.md` of `examples/backends/megatron/`.
+- HuggingFace tokenizer matching the Megatron tokenizer used at training.
+  The Dynamo frontend tokenizes with this — must match what Megatron was
+  trained with, or generation will be garbage.
 
-## Container image (one image, both stacks baked in)
+## Building the image
 
-The Dynamo container build supports `--framework megatron`, mirroring the
-trtllm and vllm images: NGC PyTorch base + Megatron-LM cloned at build time +
-Dynamo wheels + nats/etcd binaries. From the dynamo checkout root:
+Build on a Docker-capable host (typically the login node), push to a
+registry, import to enroot on the cluster.
 
 ```bash
+# 1. Render the Dockerfile (Megatron's pin: pytorch:26.04-py3 on cuda12.9).
 cd container
-
-# Render the Dockerfile (Megatron's pin: pytorch:26.04-py3 on cuda12.9).
 python render.py --framework megatron --target runtime \
     --platform linux/arm64 --cuda-version 12.9 \
     --output-short-filename
 
-# Build, pointing MEGATRON_REPO/MEGATRON_REF at the feature branch with the
-# streaming patches. Drop --build-arg overrides once they're merged upstream.
-docker buildx build \
-    --platform linux/arm64 \
-    --build-arg MEGATRON_REPO=https://github.com/<your-fork>/Megatron-LM.git \
-    --build-arg MEGATRON_REF=feature/dynamo-streaming \
-    -t dynamo-megatron:phase0 \
-    -f rendered.Dockerfile \
-    ..
+# 2. Build and push.
+docker buildx build --platform linux/arm64 \
+    --build-arg MEGATRON_REPO=https://github.com/<fork>/Megatron-LM.git \
+    --build-arg MEGATRON_REF=dynamo-integration \
+    -t <user>/dynamo-megatron:phase0-arm64 \
+    --push \
+    -f rendered.Dockerfile ..
+
+# 3. On the cluster (login node): import to a lustre-resident squashfs.
+cd $STAGE
+enroot import docker://<user>/dynamo-megatron:phase0-arm64
+# Produces: <user>+dynamo-megatron+phase0-arm64.sqsh
 ```
 
-For local Megatron development (changing the streaming protocol without
-pushing commits), build once at any ref then mount your live worktree over
-`/opt/megatron-lm` at run time:
+`enroot import` reads `~/.config/enroot/.credentials` for private-image
+pulls. The expected format:
 
-```bash
-docker run --rm -it --gpus all \
-    -v /path/to/local/Megatron-LM:/opt/megatron-lm \
-    -v /shared/models:/shared/models:ro \
-    --network host \
-    dynamo-megatron:phase0
+```
+machine auth.docker.io login <dockerhub-user> password <PAT>
+machine registry-1.docker.io login <dockerhub-user> password <PAT>
 ```
 
-The clone in the image stays as the fallback; the bind mount shadows it. Both
-the coordinator and the Dynamo worker live in this image — launch them as
-separate `docker run` invocations (or `srun` steps on Slurm, see below) all
-pointing at `dynamo-megatron:phase0`.
+Both endpoints are required. If a fresh `srun` on a new node 401s when
+fetching the image, your credentials file isn't on shared storage and that
+node hasn't seen it — put it on lustre and set `ENROOT_CONFIG_PATH` to
+point at the directory holding it.
 
-## Submit
-
-```bash
-sbatch \
-
-## Interactive bring-up (recommended for first run)
-
-When iterating on the integration code, use `INTERACTIVE.md` instead of the
-sbatch — `salloc` + tmux lets you restart the worker / frontend without
-re-loading the 8B checkpoint.
-
-## Submit
+## One-time per-session setup
 
 ```bash
-sbatch \
-  --account=<acct> --partition=<partition> \
-  --export=ALL,\
-MEGATRON_WORKTREE=/path/to/Megatron-LM,\
-DYNAMO_WORKTREE=/path/to/dynamo,\
-MODEL_CHECKPOINT=/path/to/llama-3.1-8b-mcore,\
-TOKENIZER_MODEL=meta-llama/Llama-3.1-8B,\
-SERVED_MODEL_NAME=llama-3.1-8b,\
-ETCD_ENDPOINTS=http://etcd-host:2379,\
-NATS_SERVER=nats://nats-host:4222 \
-  launch_phase0.slurm
+export DMG_SQSH=/lustre/fsw/portfolios/nemotron/users/csathe/chaitrasathe+dynamo-megatron+phase0-arm64.sqsh
+export STAGE=/lustre/fsw/portfolios/nemotron/users/csathe
+mkdir -p $STAGE/hf-cache    # first time only
 ```
 
-Logs land under `logs/`:
+## Bring it up
 
-- `logs/megatron-dynamo-phase0-<jobid>.out` — sbatch driver script.
-- `logs/coordinator-<jobid>.out` — Megatron engine stdout, including the
-  `MEGATRON_COORDINATOR_ADDR=...` line we grep for.
-- `logs/dynamo-worker-<jobid>.out` — Dynamo worker stdout.
+```bash
+salloc --nodes=1 --gpus-per-node=2 --time=02:00:00 --account=<a> --partition=<p>
+tmux
+
+# Pane A — orchestrator (blocks until Ctrl-C)
+bash examples/backends/megatron/phase0/launch_phase0.sh
+# Wait for "PHASE0_READY" on stdout.
+
+# Pane B — run tests against the running stack
+srun --jobid=$SLURM_JOB_ID --overlap --container-name=dmg --pty bash
+bash /workspace/examples/backends/megatron/phase0/test_phase0.sh
+# or:
+pytest -q /workspace/examples/backends/megatron/phase0/test_phase0.py
+```
+
+Optional knobs (env vars consumed by `orchestrate.sh`):
+
+| Var | Default | What it does |
+|---|---|---|
+| `TP` | `2` | Tensor-parallel size for the coordinator. |
+| `MODEL_CHECKPOINT` | `$STAGE/models/Llama-3.1-8B-mcore` | Megatron checkpoint path. |
+| `TOKENIZER_MODEL` | `meta-llama/Llama-3.1-8B` | HF id for both Megatron's `--tokenizer-model` and Dynamo's `--model`. |
+| `SERVED_MODEL_NAME` | `llama-3.1-8b` | Name advertised to clients. |
+| `CONTEXT_LENGTH` | `4096` | Advertised on the model card. |
+| `HTTP_PORT` | `8080` | Frontend bind port. |
+| `COORD_PORT` | `5555` | Coordinator ROUTER bind port. |
+| `MEGATRON_LOCAL_DEV` | unset | Path to a host Megatron-LM checkout. If set, the wrapper bind-mounts it over `/opt/megatron-lm` for live editing without rebuilding. |
+
+For fast iteration on the streaming protocol, swap to **Llama-3.2-1B**,
+`TP=1`:
+
+```bash
+TP=1 \
+MODEL_CHECKPOINT=$STAGE/models/Llama-3.2-1B-mcore \
+TOKENIZER_MODEL=meta-llama/Llama-3.2-1B \
+SERVED_MODEL_NAME=llama-3.2-1b \
+  bash examples/backends/megatron/phase0/launch_phase0.sh
+```
+
+The integration code is identical at 1B and 8B; restart cost drops from
+~30–60 s to ~5 s.
 
 ## Smoke test
 
-Once the worker registers (look for the `register_model` success line in
-`dynamo-worker-<jobid>.out`), hit the frontend:
+Once `PHASE0_READY` appears, from any pane attached to the container:
 
 ```bash
-curl -N http://<frontend-host>/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{
-        "model": "llama-3.1-8b",
-        "messages": [{"role":"user","content":"Hello in one short sentence."}],
-        "stream": true,
-        "max_tokens": 64
-      }'
+curl -s http://127.0.0.1:8080/v1/models | jq .
+
+curl -N http://127.0.0.1:8080/v1/chat/completions \
+    -H 'content-type: application/json' \
+    -d '{"model":"llama-3.1-8b",
+         "messages":[{"role":"user","content":"Hello in one short sentence."}],
+         "stream":true,"max_tokens":64}'
 ```
 
 Expected: token-by-token SSE chunks. The Megatron engine emits one
@@ -133,32 +151,82 @@ Expected: token-by-token SSE chunks. The Megatron engine emits one
 into a streamed `{"token_ids": [...]}` chunk; the frontend detokenizes and
 streams `delta.content` back to curl.
 
-## Known limitations (Phase 0)
+## Debugging
 
-- **No KV-aware routing.** The Dynamo worker does not publish KV events yet,
-  so the frontend can only route round-robin / least-loaded.
-- **No metrics.** No `ForwardPassMetrics`. The Dynamo router has zero load
-  visibility into Megatron.
-- **No disagg.** Single worker handles both prefill and decode for each
-  request. No NIXL handoff.
-- **Tokenizer must match.** Dynamo's frontend tokenizes with the HF tokenizer
-  specified by `--model`. Megatron's engine receives the resulting token IDs
-  verbatim and uses them as `prompt_tokens` — if Megatron was trained with a
-  different tokenizer, generation will be garbage. Always pass the same HF
-  tokenizer id to both sides.
-- **Single-node only.** Multi-node coordinator + multi-node worker pools come
-  with Phase 5.
+The orchestrator tees every component to a log file in the container's
+`/tmp/`. Tail any of these from an attached pane:
 
-## Troubleshooting
+| Log | Component |
+|---|---|
+| `/tmp/nats.log` | NATS server |
+| `/tmp/etcd.log` | etcd |
+| `/tmp/coordinator.log` | Megatron coordinator (torchrun stdout/stderr, including `MEGATRON_COORDINATOR_ADDR=...`) |
+| `/tmp/worker.log` | `dynamo.megatron` |
+| `/tmp/frontend.log` | `dynamo.frontend` |
 
-- **Address never appears:** `coordinator-<jobid>.out` has the engine startup
-  trace. Common causes: tokenizer download failure, missing
-  `--tensor-model-parallel-size` divisibility, OOM during model load.
-- **Worker exits immediately:** `dynamo-worker-<jobid>.out` will show the
-  cause. Most often: NATS/etcd unreachable, or `megatron-core` missing from
-  the Dynamo worker's Python env.
-- **Streaming stalls after first token:** check that the coordinator log
-  shows `coordinator_streaming` NVTX scopes firing (with NVTX off, just check
-  for absence of errors). Most stalls come from a request being submitted
-  without `sampling_params.streaming=True` — which our handler always sets,
-  so this should not happen in Phase 0, but it is the first place to look.
+If the orchestrator dies with `FATAL: <something>`, the named log has the
+underlying error.
+
+### Restarting a single component without re-loading the model
+
+The expensive process is the coordinator (model load). To restart only the
+worker or the frontend without dropping the model:
+
+```bash
+# In any attached pane:
+pkill -f 'python -m dynamo.megatron'                  # or dynamo.frontend
+# Re-run just that line from orchestrate.sh by hand:
+python -m dynamo.megatron --coordinator-addr "$MEGATRON_COORDINATOR_ADDR" \
+    --model "$PHASE0_MODEL_NAME" ... 2>&1 | tee /tmp/worker.log
+```
+
+`/tmp/phase0.env` was written by the orchestrator with all the right
+addresses, so `source /tmp/phase0.env` first.
+
+### Live Megatron-LM iteration
+
+The image clones Megatron at build time. To edit `inference_client.py`,
+`headers.py`, or the coordinator without rebuilding:
+
+```bash
+MEGATRON_LOCAL_DEV=$STAGE/Megatron-LM \
+  bash examples/backends/megatron/phase0/launch_phase0.sh
+```
+
+The host checkout shadows `/opt/megatron-lm` inside the container; restart
+the coordinator (or the whole stack) to pick up edits.
+
+## Common gotchas
+
+- **Coordinator address never appears in `/tmp/coordinator.log`.** Tokenizer
+  download failure (check `HF_HOME` reachability), `--tensor-model-parallel-size`
+  divisibility against the checkpoint, or OOM during model load.
+- **Worker exits immediately.** Most often the `--coordinator-addr` was
+  captured before the coordinator finished binding (the orchestrator's
+  health checks should prevent this, but if you restarted the worker by
+  hand, re-grep `/tmp/coordinator.log` for the latest address).
+- **Streaming stalls after first token.** Check `/tmp/coordinator.log` for
+  engine errors. Most stalls come from a request being submitted without
+  `sampling_params.streaming=True` — the handler always sets this, so it
+  should not happen in Phase 0, but it is the first place to look.
+- **Port collisions on rerun.** If you Ctrl-C the orchestrator and
+  immediately re-run, `:5555` (coordinator) or `:8080` (frontend) may be in
+  TIME_WAIT for ~30 s. Either wait, or set `COORD_PORT` / `HTTP_PORT` to
+  different values for the retry.
+- **Stale model in etcd after a hard kill.** If the worker dies without
+  graceful shutdown its etcd entry lingers until the lease expires (~30 s).
+  The frontend may keep advertising a model that no longer answers. If a
+  curl hangs after a worker restart, wait the lease out or
+  `etcdctl get --prefix /dynamo` to inspect.
+- **Tokenizer mismatch is silent.** If `TOKENIZER_MODEL` doesn't match the
+  HF id Megatron was trained with, generation will be garbage but nothing
+  will error. The orchestrator passes the same value to both Megatron's
+  `--tokenizer-model` and the Dynamo worker's `--model`, so if you override
+  one, override both.
+- **`HF_HOME` on lustre is mandatory for new model ids.** Without it, the
+  Megatron coordinator and the frontend download tokenizer files into
+  ephemeral container storage. Cold-start downloads can be slow on lustre —
+  pre-populate by running `huggingface-cli download meta-llama/Llama-3.1-8B`
+  on the login node with `HF_HOME=$STAGE/hf-cache` set.
+- **`enroot import` 401s.** See the credentials file format in "Building
+  the image" above.
