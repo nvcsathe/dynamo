@@ -14,7 +14,11 @@
 set -uo pipefail
 
 STAGE="${STAGE:?STAGE must be set (e.g. /lustre/fsw/portfolios/nemotron/users/csathe)}"
-MODEL_CHECKPOINT="${MODEL_CHECKPOINT:-${STAGE}/models/Llama-3.1-8B-mcore}"
+# Phase-0 test checkpoint lives in ksanthanam's lustre portfolio (mounted
+# read-only by launch_phase0.sh). Edit MODEL_DIR below to match the actual
+# directory name once known.
+MODEL_DIR="${MODEL_DIR:-llama3.1-8b-mcore}"
+MODEL_CHECKPOINT="${MODEL_CHECKPOINT:-/lustre/fsw/portfolios/llmservice/users/ksanthanam/${MODEL_DIR}}"
 TOKENIZER_MODEL="${TOKENIZER_MODEL:-meta-llama/Llama-3.1-8B}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-llama-3.1-8b}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-4096}"

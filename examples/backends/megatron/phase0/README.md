@@ -110,7 +110,8 @@ Optional knobs (env vars consumed by `orchestrate.sh`):
 | Var | Default | What it does |
 |---|---|---|
 | `TP` | `2` | Tensor-parallel size for the coordinator. |
-| `MODEL_CHECKPOINT` | `$STAGE/models/Llama-3.1-8B-mcore` | Megatron checkpoint path. |
+| `MODEL_DIR` | `llama3.1-8b-mcore` | Subdirectory under `/lustre/fsw/portfolios/llmservice/users/ksanthanam/` containing the mcore checkpoint. The launcher bind-mounts that dir read-only. |
+| `MODEL_CHECKPOINT` | `/lustre/fsw/portfolios/llmservice/users/ksanthanam/$MODEL_DIR` | Full checkpoint path. Override if the model isn't under ksanthanam's portfolio. |
 | `TOKENIZER_MODEL` | `meta-llama/Llama-3.1-8B` | HF id for both Megatron's `--tokenizer-model` and Dynamo's `--model`. |
 | `SERVED_MODEL_NAME` | `llama-3.1-8b` | Name advertised to clients. |
 | `CONTEXT_LENGTH` | `4096` | Advertised on the model card. |
