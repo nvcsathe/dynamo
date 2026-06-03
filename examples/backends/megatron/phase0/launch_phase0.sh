@@ -12,9 +12,6 @@
 #   MODEL_CHECKPOINT, TOKENIZER_MODEL, SERVED_MODEL_NAME, TP, HTTP_PORT
 #   COORD_PORT, CONTEXT_LENGTH, MASTER_PORT, MEGATRON_LOCAL_DEV
 #
-# The Phase-0 test model lives in ksanthanam's lustre portfolio. This wrapper
-# bind-mounts that dir read-only into the container. See KSANTH_MODELS below.
-#
 # If MEGATRON_LOCAL_DEV is set, the host directory it points to is mounted
 # over /opt/megatron-lm so you can edit InferenceClient / coordinator code
 # without rebuilding the image.
@@ -35,10 +32,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DYNAMO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 
-# Phase-0 test checkpoint lives here. Mounted read-only.
-KSANTH_MODELS=/lustre/fsw/portfolios/llmservice/users/ksanthanam
-
-MOUNTS="$STAGE:$STAGE,$DYNAMO_ROOT:/workspace,$KSANTH_MODELS:$KSANTH_MODELS:ro"
+MOUNTS="$STAGE:$STAGE,$DYNAMO_ROOT:/workspace"
 if [[ -n "${MEGATRON_LOCAL_DEV:-}" ]]; then
     [[ -d "$MEGATRON_LOCAL_DEV" ]] || { echo "MEGATRON_LOCAL_DEV not a dir: $MEGATRON_LOCAL_DEV" >&2; exit 1; }
     MOUNTS="$MOUNTS,$MEGATRON_LOCAL_DEV:/opt/megatron-lm"

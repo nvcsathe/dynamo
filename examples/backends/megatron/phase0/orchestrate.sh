@@ -13,17 +13,14 @@
 
 set -uo pipefail
 
-STAGE="${STAGE:?STAGE must be set (e.g. /lustre/fsw/portfolios/nemotron/users/csathe)}"
-# Phase-0 test checkpoint lives in ksanthanam's lustre portfolio (mounted
-# read-only by launch_phase0.sh). Edit MODEL_DIR below to match the actual
-# directory name once known.
-MODEL_DIR="${MODEL_DIR:-llama3.1-8b-mcore}"
-MODEL_CHECKPOINT="${MODEL_CHECKPOINT:-/lustre/fsw/portfolios/llmservice/users/ksanthanam/${MODEL_DIR}}"
-TOKENIZER_MODEL="${TOKENIZER_MODEL:-meta-llama/Llama-3.1-8B}"
-SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-llama-3.1-8b}"
+STAGE="${STAGE:-/lustre/fsw/portfolios/nemotron/users/csathe}"
+MODEL_DIR="${MODEL_DIR:-llama3.1-8b-instruct-mcore}"
+MODEL_CHECKPOINT="${MODEL_CHECKPOINT:-$STAGE/models/${MODEL_DIR}}"
+TOKENIZER_MODEL="${TOKENIZER_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-llama-3.1-8b-instruct}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-4096}"
 TP="${TP:-2}"
-HTTP_PORT="${HTTP_PORT:-8080}"
+HTTP_PORT="${HTTP_PORT:-8100}"
 COORD_PORT="${COORD_PORT:-5555}"
 
 export NATS_SERVER="nats://127.0.0.1:4222"
@@ -91,6 +88,7 @@ wait_for "etcd /health"   30 curl -sf http://127.0.0.1:2379/health  || die "etcd
 # — Megatron's arg validator requires these even though the checkpoint
 # already carries the geometry. Override for non-Llama-3.1-8B models.
 MODEL_ARGS=(
+    --ckpt-format torch_dist
     --use-checkpoint-args
     --disable-bias-linear
     --transformer-impl transformer_engine
@@ -168,9 +166,10 @@ log "starting Dynamo frontend on :$HTTP_PORT..."
 # create_runtime(request_plane="nats", event_plane="nats"). On some image
 # builds the frontend defaults to TCP, which then fails to dial the
 # worker's NATS subject as a socket address.
-DYN_REQUEST_PLANE=nats DYN_EVENT_PLANE=nats \
 python -m dynamo.frontend \
     --http-port "$HTTP_PORT" \
+    --request-plane nats \
+    --event-plane nats \
     > "$LOG_DIR/frontend.log" 2>&1 &
 PIDS+=($!)
 
