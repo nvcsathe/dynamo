@@ -67,7 +67,9 @@ wait_for() {
 # 1. NATS + etcd
 ###############################################################################
 log "starting NATS..."
-nats-server --jetstream --store_dir /tmp/nats-jetstream --port 4222 \
+# -m 8222 exposes the HTTP monitoring endpoint we curl for /healthz below.
+# Without it nats-server runs fine on :4222 but the healthcheck times out.
+nats-server --jetstream --store_dir /tmp/nats-jetstream --port 4222 -m 8222 \
     > "$LOG_DIR/nats.log" 2>&1 &
 PIDS+=($!)
 
@@ -84,6 +86,37 @@ wait_for "etcd /health"   30 curl -sf http://127.0.0.1:2379/health  || die "etcd
 ###############################################################################
 # 2. Megatron coordinator (torchrun TP=$TP)
 ###############################################################################
+# Model-architecture flags. Lifted verbatim from
+# Megatron-LM/examples/inference/llama_mistral/run_text_generation_llama3.1.sh
+# — Megatron's arg validator requires these even though the checkpoint
+# already carries the geometry. Override for non-Llama-3.1-8B models.
+MODEL_ARGS=(
+    --use-checkpoint-args
+    --disable-bias-linear
+    --transformer-impl transformer_engine
+    --normalization RMSNorm
+    --group-query-attention --num-query-groups 8
+    --no-masked-softmax-fusion
+    --attention-softmax-in-fp32
+    --attention-dropout 0.0
+    --hidden-dropout 0.0
+    --untie-embeddings-and-output-weights
+    --position-embedding-type rope
+    --rotary-percent 1.0
+    --rotary-base 500000
+    --use-rope-scaling
+    --use-rotary-position-embeddings
+    --swiglu
+    --num-layers 32
+    --hidden-size 4096
+    --ffn-hidden-size 14336
+    --num-attention-heads 32
+    --max-position-embeddings 131072
+    --seq-length 8192
+    --micro-batch-size 1
+    --bf16
+)
+
 log "starting Megatron coordinator (TP=$TP, model=$MODEL_CHECKPOINT)..."
 (
     cd /opt/megatron-lm
@@ -98,7 +131,7 @@ log "starting Megatron coordinator (TP=$TP, model=$MODEL_CHECKPOINT)..."
             --load "$MODEL_CHECKPOINT" \
             --tokenizer-type HuggingFaceTokenizer \
             --tokenizer-model "$TOKENIZER_MODEL" \
-            --bf16 --use-flash-attn
+            "${MODEL_ARGS[@]}"
 ) > "$LOG_DIR/coordinator.log" 2>&1 &
 PIDS+=($!)
 
@@ -120,16 +153,24 @@ python -m dynamo.megatron \
     > "$LOG_DIR/worker.log" 2>&1 &
 PIDS+=($!)
 
-# Worker is "ready" when it has registered the model with etcd.
-wait_for "worker registered" 120 \
-    bash -c "grep -q 'register_model' '$LOG_DIR/worker.log' || grep -q 'serve_endpoint' '$LOG_DIR/worker.log'" \
+# Worker is "ready" when the Rust _core binding has registered the model
+# card. The 300 s budget accounts for first-time HuggingFace tokenizer
+# downloads via ModelExpress (~60 s for an 8B model).
+wait_for "worker registered" 300 \
+    grep -q "Registered base model" "$LOG_DIR/worker.log" \
     || die "worker never registered (see $LOG_DIR/worker.log)"
 
 ###############################################################################
 # 4. Dynamo frontend (HTTP)
 ###############################################################################
 log "starting Dynamo frontend on :$HTTP_PORT..."
-python -m dynamo.frontend --http-port "$HTTP_PORT" \
+# Pin both planes to NATS — the worker registers on NATS via
+# create_runtime(request_plane="nats", event_plane="nats"). On some image
+# builds the frontend defaults to TCP, which then fails to dial the
+# worker's NATS subject as a socket address.
+DYN_REQUEST_PLANE=nats DYN_EVENT_PLANE=nats \
+python -m dynamo.frontend \
+    --http-port "$HTTP_PORT" \
     > "$LOG_DIR/frontend.log" 2>&1 &
 PIDS+=($!)
 

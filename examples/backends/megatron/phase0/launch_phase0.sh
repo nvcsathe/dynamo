@@ -45,8 +45,9 @@ if [[ -n "${MEGATRON_LOCAL_DEV:-}" ]]; then
     echo "[launch] live Megatron mount: $MEGATRON_LOCAL_DEV -> /opt/megatron-lm"
 fi
 
-# Forward env that orchestrate.sh consumes.
-EXPORT_VARS="STAGE,HF_HOME,MODEL_CHECKPOINT,TOKENIZER_MODEL,SERVED_MODEL_NAME"
+# Forward env that orchestrate.sh consumes. HF_TOKEN is needed for gated
+# repos like meta-llama/Llama-3.1-8B.
+EXPORT_VARS="STAGE,HF_HOME,HF_TOKEN,MODEL_CHECKPOINT,MODEL_DIR,TOKENIZER_MODEL,SERVED_MODEL_NAME"
 EXPORT_VARS="$EXPORT_VARS,CONTEXT_LENGTH,TP,HTTP_PORT,COORD_PORT,MASTER_PORT"
 
 echo "[launch] container: $DMG_SQSH"

@@ -16,7 +16,13 @@ import logging
 import uvloop
 
 from dynamo.common.utils.runtime import create_runtime
-from dynamo.llm import ModelInput, ModelType, WorkerType, register_model
+from dynamo.llm import (
+    ModelInput,
+    ModelRuntimeConfig,
+    ModelType,
+    WorkerType,
+    register_model,
+)
 from dynamo.runtime.logging import configure_dynamo_logging
 
 from dynamo.megatron.args import parse_args
@@ -45,6 +51,16 @@ async def worker() -> None:
 
     handler = DecodeWorkerHandler(config, engine_client)
 
+    # Populate a minimal ModelRuntimeConfig. Phase 0 doesn't have real KV
+    # stats, but the frontend's request-routing path keys on these fields to
+    # decide NATS-vs-TCP dispatch; leaving them null falls through to a TCP
+    # default and the frontend then tries to dial the worker's NATS subject
+    # as a socket address ("Invalid TCP address ...").
+    runtime_config = ModelRuntimeConfig()
+    runtime_config.total_kv_blocks = 0
+    runtime_config.max_num_seqs = 1
+    runtime_config.max_num_batched_tokens = config.context_length
+
     try:
         await asyncio.gather(
             generate_endpoint.serve_endpoint(
@@ -58,6 +74,7 @@ async def worker() -> None:
                 config.model,
                 config.served_model_name,
                 context_length=config.context_length,
+                runtime_config=runtime_config,
                 worker_type=WorkerType.Aggregated,
                 needs=[],
             ),
