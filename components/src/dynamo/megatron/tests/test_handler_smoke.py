@@ -21,18 +21,19 @@ from dynamo.megatron.handlers import DecodeWorkerHandler
 pytestmark = pytest.mark.asyncio
 
 
-def _make_config() -> Config:
+def _make_config(role: str = "aggregated") -> Config:
     return Config(
         coordinator_addr="tcp://127.0.0.1:0",
         model="dummy/model",
         served_model_name="dummy/model",
         context_length=2048,
         namespace="dynamo",
-        component="backend",
+        component="backend" if role != "prefill" else "prefill",
         endpoint="generate",
         discovery_backend="etcd",
         request_plane="nats",
         event_plane="nats",
+        role=role,
     )
 
 

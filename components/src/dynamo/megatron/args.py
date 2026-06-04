@@ -24,6 +24,7 @@ class Config:
     discovery_backend: str
     request_plane: str
     event_plane: str
+    role: str  # "aggregated" | "prefill" | "decode"
 
 
 def parse_args(argv: list[str] | None = None) -> Config:
@@ -65,12 +66,35 @@ def parse_args(argv: list[str] | None = None) -> Config:
         help="Max context length to advertise on the model card.",
     )
     parser.add_argument("--namespace", default="dynamo")
-    parser.add_argument("--component", default="backend")
+    parser.add_argument(
+        "--component",
+        default=None,
+        help=(
+            "Dynamo component name. Defaults to 'backend' for aggregated/decode "
+            "and 'prefill' for --role prefill."
+        ),
+    )
     parser.add_argument("--endpoint", default="generate")
     parser.add_argument("--discovery-backend", default="etcd")
     parser.add_argument("--request-plane", default="nats")
     parser.add_argument("--event-plane", default="nats")
+    parser.add_argument(
+        "--role",
+        choices=["aggregated", "prefill", "decode"],
+        default="aggregated",
+        help=(
+            "Disagg role. 'aggregated' (default) keeps Phase-0 behavior. "
+            "'prefill' registers as a PrefillWorker that returns disaggregated_params; "
+            "'decode' rejects requests without prefill_result and imports KV."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    # Default the component name to match the role so the frontend's
+    # PrefillRouter can find each worker on its expected NATS subject.
+    component = args.component
+    if component is None:
+        component = "prefill" if args.role == "prefill" else "backend"
 
     return Config(
         coordinator_addr=args.coordinator_addr,
@@ -78,9 +102,10 @@ def parse_args(argv: list[str] | None = None) -> Config:
         served_model_name=args.served_model_name or args.model,
         context_length=args.context_length,
         namespace=args.namespace,
-        component=args.component,
+        component=component,
         endpoint=args.endpoint,
         discovery_backend=args.discovery_backend,
         request_plane=args.request_plane,
         event_plane=args.event_plane,
+        role=args.role,
     )

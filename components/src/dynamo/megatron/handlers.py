@@ -44,7 +44,14 @@ def _build_sampling_params(request: dict[str, Any]) -> SamplingParams:
 
 
 class DecodeWorkerHandler:
-    """Aggregated decode handler. Streams tokens from Megatron to Dynamo."""
+    """Aggregated or disagg-decode handler.
+
+    In ``role=aggregated`` mode the handler streams tokens from Megatron as in
+    Phase 0. In ``role=decode`` mode the handler requires ``prefill_result`` to
+    be present in the request and routes through
+    :meth:`MegatronEngineClient.decode_with_kv` so the engine can NIXL-pull the
+    prefill peer's KV state before generating.
+    """
 
     def __init__(self, config: Config, engine_client: MegatronEngineClient):
         self.config = config
@@ -58,8 +65,49 @@ class DecodeWorkerHandler:
             raise ValueError("Megatron backend requires token_ids in the request")
 
         sampling_params = _build_sampling_params(request)
+        prefill_result = request.get("prefill_result")
+
+        if self.config.role == "decode":
+            if not prefill_result or not isinstance(prefill_result, dict):
+                raise ValueError(
+                    "Megatron decode worker received a request without "
+                    "prefill_result; expected the frontend's PrefillRouter to "
+                    "populate it via a Prefill peer."
+                )
+            disagg = prefill_result.get("disaggregated_params") or {}
+            kv_meta = disagg.get("kv_meta") or {}
+            src_block_ids = list(disagg.get("block_ids") or [])
+            first_token = disagg.get("first_token")
+            logger.debug(
+                "Megatron decode handler: %d input tokens, %d imported KV blocks",
+                len(token_ids),
+                len(src_block_ids),
+            )
+            request_id_for_release: int | None = None
+            try:
+                async for chunk in self.engine_client.decode_with_kv(
+                    token_ids,
+                    sampling_params,
+                    kv_meta,
+                    src_block_ids,
+                    first_token,
+                ):
+                    response: dict[str, Any] = {"token_ids": chunk["new_tokens"]}
+                    if chunk["finished"]:
+                        response["finish_reason"] = "stop"
+                        reply = chunk.get("reply") or {}
+                        request_id_for_release = reply.get("request_id")
+                    yield response
+            finally:
+                # Always tell the prefill engine to release its pinned blocks,
+                # whether decode finished normally or errored out.
+                if request_id_for_release is not None:
+                    self.engine_client.release_handoff(request_id_for_release)
+            return
+
+        # Aggregated mode — Phase-0 path, unchanged.
         logger.debug(
-            "Megatron handler: %d input tokens, max_new=%s, streaming=True",
+            "Megatron aggregated handler: %d input tokens, max_new=%s, streaming=True",
             len(token_ids),
             sampling_params.num_tokens_to_generate,
         )
@@ -67,8 +115,42 @@ class DecodeWorkerHandler:
         async for chunk in self.engine_client.generate(token_ids, sampling_params):
             response: dict[str, Any] = {"token_ids": chunk["new_tokens"]}
             if chunk["finished"]:
-                # Phase 0 does not propagate Megatron's finish reason granularly.
-                # The frontend treats absence of further chunks as completion;
-                # this flag makes intent explicit for downstream consumers.
                 response["finish_reason"] = "stop"
             yield response
+
+
+class PrefillWorkerHandler:
+    """Phase-3 prefill handler. Runs one prefill step, returns disaggregated_params.
+
+    The frontend's :class:`PrefillRouter` consumes the response's
+    ``disaggregated_params`` field and ships it to a decode peer via the
+    standard ``prefill_result`` envelope.
+    """
+
+    def __init__(self, config: Config, engine_client: MegatronEngineClient):
+        self.config = config
+        self.engine_client = engine_client
+
+    async def generate(
+        self, request: dict[str, Any], context: Any
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        token_ids = list(request.get("token_ids") or [])
+        if not token_ids:
+            raise ValueError("Megatron prefill backend requires token_ids in the request")
+
+        sampling_params = _build_sampling_params(request)
+        reply = await self.engine_client.prefill_for_handoff(token_ids, sampling_params)
+        disaggregated_params = reply.get("disaggregated_params") or {}
+
+        # PrefillRouter looks at top-level disaggregated_params; the rest of
+        # the dict mirrors the frontend's expected ChatCompletion-ish shape so
+        # this can also be debugged directly via curl.
+        response: dict[str, Any] = {
+            "token_ids": [],
+            "disaggregated_params": disaggregated_params,
+            "finish_reason": "stop",
+        }
+        first_token = disaggregated_params.get("first_token")
+        if first_token is not None:
+            response["token_ids"] = [int(first_token)]
+        yield response

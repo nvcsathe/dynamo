@@ -33,6 +33,81 @@ class MegatronEngineClient:
         self._started = True
         logger.info("MegatronEngineClient connected to %s", self._client.socket)
 
+    async def prefill_for_handoff(
+        self,
+        token_ids: list[int],
+        sampling_params: SamplingParams,
+    ) -> dict[str, Any]:
+        """Phase-3 prefill: submit a one-token-decode request with do_kv_handoff=True.
+
+        Returns the final reply dict once Megatron has populated KV blocks
+        and pinned them. The reply's ``disaggregated_params`` field carries
+        ``{block_ids, kv_meta, first_token}`` for the decode peer.
+
+        This is non-streaming — prefill produces exactly one token, so we just
+        consume the iterator to completion and return the final frame.
+        """
+        if not self._started:
+            raise RuntimeError("MegatronEngineClient.start() must be called first")
+        # Prefill emits a single ENGINE_REPLY (no partials). Force handoff on,
+        # cap generation at 1 token, force streaming off.
+        sampling_params.do_kv_handoff = True
+        sampling_params.streaming = False
+        sampling_params.num_tokens_to_generate = 1
+
+        iterator = self._client.add_request_streaming(token_ids, sampling_params)
+        # Even with streaming=False, add_request_streaming wires a queue and
+        # delivers the final reply through `final`. Loop until we see it.
+        async for item in iterator:
+            if "final" in item:
+                reply = item["final"]
+                # `reply` is a serialized DynamicInferenceRequest dict (because
+                # InferenceClient was constructed with deserialize=False).
+                # disaggregated_params rides as a top-level field.
+                return reply
+        raise RuntimeError("MegatronEngineClient.prefill_for_handoff: stream ended without final")
+
+    async def decode_with_kv(
+        self,
+        token_ids: list[int],
+        sampling_params: SamplingParams,
+        kv_meta: dict[str, Any],
+        src_block_ids: list[int],
+        first_token: int | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Phase-3 decode: submit a request that imports KV from a prefill peer.
+
+        Streams tokens identically to :meth:`generate`; the only difference is
+        the engine-side wire header (SUBMIT_REQUEST_WITH_KV) and the extra
+        ``kv_meta`` / ``src_block_ids`` payload.
+        """
+        if not self._started:
+            raise RuntimeError("MegatronEngineClient.start() must be called first")
+        iterator = self._client.add_request_with_kv_handoff(
+            token_ids,
+            sampling_params,
+            kv_meta,
+            src_block_ids,
+            first_token,
+        )
+        emitted_count = 0
+        async for item in iterator:
+            if "partial" in item:
+                new_tokens = item["partial"]["new_tokens"]
+                emitted_count += len(new_tokens)
+                yield {"new_tokens": new_tokens, "finished": False}
+            elif "final" in item:
+                reply = item["final"]
+                generated = reply.get("generated_tokens") or []
+                tail = list(generated[emitted_count:])
+                yield {"new_tokens": tail, "finished": True, "reply": reply}
+
+    def release_handoff(self, request_id: int) -> None:
+        """Tell the coordinator to release blocks pinned by the prefill engine."""
+        if not self._started:
+            return
+        self._client.release_handoff(request_id)
+
     async def generate(
         self,
         token_ids: list[int],

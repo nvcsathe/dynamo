@@ -27,7 +27,7 @@ from dynamo.runtime.logging import configure_dynamo_logging
 
 from dynamo.megatron.args import parse_args
 from dynamo.megatron.engine_client import MegatronEngineClient
-from dynamo.megatron.handlers import DecodeWorkerHandler
+from dynamo.megatron.handlers import DecodeWorkerHandler, PrefillWorkerHandler
 
 configure_dynamo_logging()
 logger = logging.getLogger(__name__)
@@ -49,13 +49,26 @@ async def worker() -> None:
     engine_client = MegatronEngineClient(config.coordinator_addr)
     engine_client.start()
 
-    handler = DecodeWorkerHandler(config, engine_client)
+    # Pick handler + frontend registration based on disagg role.
+    if config.role == "prefill":
+        handler = PrefillWorkerHandler(config, engine_client)
+        model_type = ModelType.Prefill
+        worker_type = WorkerType.Prefill
+        needs = [[WorkerType.Decode]]
+    elif config.role == "decode":
+        handler = DecodeWorkerHandler(config, engine_client)
+        model_type = ModelType.Chat
+        worker_type = WorkerType.Decode
+        needs = [[WorkerType.Prefill]]
+    else:
+        handler = DecodeWorkerHandler(config, engine_client)
+        model_type = ModelType.Chat
+        worker_type = WorkerType.Aggregated
+        needs = []
 
-    # Populate a minimal ModelRuntimeConfig. Phase 0 doesn't have real KV
-    # stats, but the frontend's request-routing path keys on these fields to
-    # decide NATS-vs-TCP dispatch; leaving them null falls through to a TCP
-    # default and the frontend then tries to dial the worker's NATS subject
-    # as a socket address ("Invalid TCP address ...").
+    # Minimal ModelRuntimeConfig — Phase-0 stubs apply equally to all roles.
+    # The frontend keys NATS-vs-TCP dispatch on these fields; leaving them
+    # null falls through to a TCP default that breaks request routing.
     runtime_config = ModelRuntimeConfig()
     runtime_config.total_kv_blocks = 0
     runtime_config.max_num_seqs = 1
@@ -69,14 +82,14 @@ async def worker() -> None:
             ),
             register_model(
                 ModelInput.Tokens,
-                ModelType.Chat,
+                model_type,
                 generate_endpoint,
                 config.model,
                 config.served_model_name,
                 context_length=config.context_length,
                 runtime_config=runtime_config,
-                worker_type=WorkerType.Aggregated,
-                needs=[],
+                worker_type=worker_type,
+                needs=needs,
             ),
         )
     finally:
