@@ -15,6 +15,13 @@
 
 # Megatron imports `accelerate` from megatron.training during init.
 accelerate
+# NIXL — Phase-3 disaggregated KV transport. Megatron's kv_transfer.py imports
+# `nixl._api`. The PyPI wheel bundles the native libnixl.so + UCX adapters via
+# auditwheel, so Python consumers don't need the rust-style LD_LIBRARY_PATH
+# dance vllm_runtime.Dockerfile does (that's only for Rust callers).
+# Pin minor floor at the version the disagg engine_client surface was tested
+# against; upgrade in tandem with the dynamo runtime image.
+nixl>=0.3
 # Datasets — imported by dist_checkpointing under some code paths.
 datasets
 # Megatron uses einops heavily in attention/MLP modules.

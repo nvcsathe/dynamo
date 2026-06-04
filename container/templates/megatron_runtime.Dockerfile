@@ -7,10 +7,10 @@
 ########## Runtime Image #########
 ##################################
 
-# Phase 0 image: NGC PyTorch base + Megatron-LM (cloned at build time) +
-# Dynamo wheels. Aggregated decode, streaming tokens. No NIXL, KVBM, or
-# GPU memory service — those land in later phases alongside disagg + KV
-# events.
+# Phase 0/3 image: NGC PyTorch base + Megatron-LM (cloned at build time) +
+# Dynamo wheels + NIXL (Phase-3 disagg KV transport). KVBM + GPU memory
+# service still land later. Phase-1/2 metrics + KV events are stashed under
+# .stashed_phase1_phase2/ and re-applied independently.
 
 # Transport stage — runtime pulls /workspace_src in one bind-mount cp.
 FROM scratch AS workspace_files
@@ -86,11 +86,29 @@ RUN git clone --depth 1 --branch "${MEGATRON_REF}" "${MEGATRON_REPO}" /opt/megat
 
 # Megatron-Inference + the Dynamo backend's runtime dep set. Kept narrow
 # (msgpack + pyzmq for the wire protocol, msgspec/uvloop for ai-dynamo-runtime,
-# transformers for the tokenizer path). Installed --no-deps so we don't
-# perturb upstream PyTorch's pinned numpy/triton/etc.
+# transformers for the tokenizer path, nixl for Phase-3 disagg KV transport).
+# Installed --no-deps so we don't perturb upstream PyTorch's pinned
+# numpy/triton/etc.
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     --mount=type=bind,source=./container/deps/requirements.megatron.txt,target=/tmp/requirements.megatron.txt \
     uv pip install --no-deps --requirement /tmp/requirements.megatron.txt
+
+# NIXL native libs live in an auditwheel-prepared hidden directory next to
+# the installed wheel. Python imports resolve them automatically via rpath,
+# but the libnixl plugin loader (which dlopens UCX/etcd backends at runtime)
+# searches LD_LIBRARY_PATH explicitly — without this, nixl_agent construction
+# raises "failed to load any backend" inside the engine process. Pattern
+# mirrors vllm_runtime.Dockerfile.
+#
+# The wheel name encodes the CUDA major version (e.g. ".nixl_cu12.mesonpy.libs").
+# Resolve the path at build time and symlink it to a stable location so we can
+# point LD_LIBRARY_PATH at it via an ENV directive that survives non-login
+# shells (which is what pyxis srun + orchestrate.sh launches into).
+RUN SITE_PACKAGES="$(/opt/dynamo/venv/bin/python -c 'import site; print(site.getsitepackages()[0])')" \
+    && NIXL_LIBS_DIR="$(ls -d ${SITE_PACKAGES}/.nixl_cu*.mesonpy.libs 2>/dev/null | head -1)" \
+    && [ -n "$NIXL_LIBS_DIR" ] || { echo "nixl libs not found under $SITE_PACKAGES — wheel install failed?"; exit 1; } \
+    && ln -sf "$NIXL_LIBS_DIR" /opt/dynamo/nixl-libs
+ENV LD_LIBRARY_PATH=/opt/dynamo/nixl-libs:${LD_LIBRARY_PATH:-}
 
 # Dynamo user (group 0 for OpenShift), reset upstream /workspace baggage.
 # /opt/dynamo was already created above to host the venv.
@@ -148,7 +166,8 @@ ENV DYNAMO_HOME=/workspace \
     MEGATRON_HOME=/opt/megatron-lm \
     VIRTUAL_ENV=/opt/dynamo/venv \
     PATH=/opt/dynamo/venv/bin:/usr/local/bin/etcd:${PATH} \
-    PYTHONPATH=/opt/megatron-lm:${PYTHONPATH:-}
+    PYTHONPATH=/opt/megatron-lm:${PYTHONPATH:-} \
+    LD_LIBRARY_PATH=/opt/dynamo/nixl-libs:${LD_LIBRARY_PATH:-}
 
 WORKDIR /workspace
 

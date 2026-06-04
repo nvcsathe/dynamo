@@ -4,6 +4,66 @@ This directory mirrors `phase0/`, but brings up the full disagg topology and
 adds the one assertion that actually proves disagg is working: greppable
 markers in the prefill + decode engine logs.
 
+## Building the container
+
+Phase-3 needs NIXL in the image. The Megatron Dockerfile template was
+updated to install the `nixl` PyPI wheel and wire `LD_LIBRARY_PATH` to the
+auditwheel-bundled `libnixl.so` directory. Rebuild before the first run:
+
+```bash
+# From the dynamo repo root (host with docker + adequate disk).
+cd /path/to/dynamo
+
+# 1. Render the Megatron Dockerfile, pointing MEGATRON_REF at your fork's
+#    Phase-3 branch so the engine code with --disagg-role / --kv-transfer-listen-addr
+#    is the one that gets git clone'd into /opt/megatron-lm.
+container/render.py \
+    --framework megatron \
+    --target runtime \
+    --output-short-filename
+
+# 2. Build. The MEGATRON_REPO + MEGATRON_REF overrides only matter if you do
+#    NOT plan to mount a live Megatron-LM checkout via MEGATRON_LOCAL_DEV at
+#    launch time; if you do, the baked clone is irrelevant.
+docker build \
+    -f container/rendered.Dockerfile \
+    --build-arg MEGATRON_REPO=https://github.com/<your-fork>/Megatron-LM.git \
+    --build-arg MEGATRON_REF=feature/dynamo-disagg-phase3 \
+    -t dynamo:phase3-megatron-runtime \
+    .
+
+# 3. Convert to sqsh for pyxis on the cluster.
+enroot import -o dynamo-megatron+phase3-arm64.sqsh \
+    dockerd://dynamo:phase3-megatron-runtime
+
+# 4. Push to lustre and update DMG_SQSH in your launch invocation.
+rsync -av --progress dynamo-megatron+phase3-arm64.sqsh \
+    csathe@cluster:/lustre/.../csathe/
+```
+
+If you only edited the Megatron *Python* code (not the requirements or the
+Dockerfile), you do **not** need to rebuild — bind-mount the host checkout
+via `MEGATRON_LOCAL_DEV` (see [Run](#run)).
+
+### Verifying NIXL landed in the image
+
+After the build but before pushing to the cluster:
+
+```bash
+docker run --rm dynamo:phase3-megatron-runtime python -c \
+    "from nixl._api import nixl_agent; print('nixl OK')"
+```
+
+And confirm the loader path resolves to the auditwheel libs:
+
+```bash
+docker run --rm dynamo:phase3-megatron-runtime sh -c \
+    'ls -la /opt/dynamo/nixl-libs/ && echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"'
+```
+
+Expect at least `libnixl.so.*` listed, and `LD_LIBRARY_PATH` containing
+`/opt/dynamo/nixl-libs`.
+
 ## Topology
 
 ```
