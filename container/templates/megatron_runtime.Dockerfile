@@ -86,42 +86,17 @@ RUN git clone --depth 1 --branch "${MEGATRON_REF}" "${MEGATRON_REPO}" /opt/megat
 
 # Megatron-Inference + the Dynamo backend's runtime dep set. Kept narrow
 # (msgpack + pyzmq for the wire protocol, msgspec/uvloop for ai-dynamo-runtime,
-# transformers for the tokenizer path, nixl for Phase-3 disagg KV transport).
-# Installed --no-deps so we don't perturb upstream PyTorch's pinned
-# numpy/triton/etc.
+# transformers for the tokenizer path). Installed --no-deps so we don't
+# perturb upstream PyTorch's pinned numpy/triton/etc. NIXL is NOT in this
+# requirements file — it's COPYed from wheel_builder below.
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     --mount=type=bind,source=./container/deps/requirements.megatron.txt,target=/tmp/requirements.megatron.txt \
     uv pip install --no-deps --requirement /tmp/requirements.megatron.txt
 
-# NIXL native libs live in an auditwheel-prepared hidden directory next to
-# the installed wheel. Python imports resolve them automatically via rpath,
-# but the libnixl plugin loader (which dlopens UCX/etcd backends at runtime)
-# searches LD_LIBRARY_PATH explicitly — without this, nixl_agent construction
-# raises "failed to load any backend" inside the engine process. Pattern
-# mirrors vllm_runtime.Dockerfile.
-#
-# The wheel name encodes the CUDA major version (e.g. ".nixl_cu12.mesonpy.libs").
-# Resolve the path at build time and symlink it to a stable location so we can
-# point LD_LIBRARY_PATH at it via an ENV directive that survives non-login
-# shells (which is what pyxis srun + orchestrate.sh launches into).
-RUN SITE_PACKAGES="$(/opt/dynamo/venv/bin/python -c 'import site; print(site.getsitepackages()[0])')" \
-    && NIXL_LIBS_DIR="$(ls -d ${SITE_PACKAGES}/.nixl_cu*.mesonpy.libs 2>/dev/null | head -1)" \
-    && if [ -z "$NIXL_LIBS_DIR" ]; then \
-        echo "FATAL: no .nixl_cu*.mesonpy.libs under $SITE_PACKAGES."; \
-        echo "Installed nixl-* packages:"; \
-        ls -d ${SITE_PACKAGES}/nixl* 2>/dev/null || echo "  (none)"; \
-        echo "All hidden .libs/.dist-info dirs under site-packages:"; \
-        ls -d ${SITE_PACKAGES}/.*.libs ${SITE_PACKAGES}/nixl*.dist-info 2>/dev/null || echo "  (none)"; \
-        echo "Hint: requirements.megatron.txt must pin the CUDA-suffixed wheel"; \
-        echo "(e.g. nixl-cu12), not the bare 'nixl' metapackage — with --no-deps"; \
-        echo "the metapackage doesn't pull the libnixl.so wheel transitively."; \
-        exit 1; \
-    fi \
-    && ln -sf "$NIXL_LIBS_DIR" /opt/dynamo/nixl-libs
-ENV LD_LIBRARY_PATH=/opt/dynamo/nixl-libs:${LD_LIBRARY_PATH:-}
-
 # Dynamo user (group 0 for OpenShift), reset upstream /workspace baggage.
-# /opt/dynamo was already created above to host the venv.
+# /opt/dynamo was already created above to host the venv. Must come BEFORE
+# the NIXL COPYs below — those use --chown=dynamo:0 and would fail with
+# "invalid user" if the user doesn't exist yet.
 RUN userdel -r ubuntu > /dev/null 2>&1 || true \
     && useradd -m -s /bin/bash -g 0 dynamo \
     && [ `id -u dynamo` -eq 1000 ] \
@@ -131,6 +106,28 @@ RUN userdel -r ubuntu > /dev/null 2>&1 || true \
     && chown dynamo:0 /home/dynamo /home/dynamo/.cache /opt/dynamo /workspace /opt/megatron-lm \
     && mkdir -p /etc/profile.d \
     && echo 'umask 002' > /etc/profile.d/00-umask.sh
+
+# Phase-3 disagg: NIXL native libs + Python wheels, copied from wheel_builder
+# (same pattern as dynamo_runtime.Dockerfile / trtllm_runtime.Dockerfile).
+# wheel_builder.Dockerfile builds NIXL from source against UCX when the
+# framework block in context.yaml has `nixl_ref` set — megatron does
+# (currently 0.10.1).
+ENV NIXL_PREFIX=/opt/nvidia/nvda_nixl \
+    NIXL_LIB_DIR=/opt/nvidia/nvda_nixl/lib64 \
+    NIXL_PLUGIN_DIR=/opt/nvidia/nvda_nixl/lib64/plugins
+
+ENV LD_LIBRARY_PATH=\
+${NIXL_LIB_DIR}:\
+${NIXL_PLUGIN_DIR}:\
+/usr/local/ucx/lib:\
+/usr/local/ucx/lib/ucx:\
+${LD_LIBRARY_PATH:-}
+
+# Native NIXL + UCX runtime libs, and the locally-built wheels.
+COPY --chown=dynamo:0 --from=wheel_builder /usr/local/ucx/ /usr/local/ucx/
+COPY --chown=dynamo:0 --from=wheel_builder ${NIXL_PREFIX}/ ${NIXL_PREFIX}/
+COPY --chown=dynamo:0 --from=wheel_builder /opt/dynamo/dist/nixl/ /opt/dynamo/wheelhouse/nixl/
+COPY --chown=dynamo:0 --from=wheel_builder /workspace/nixl/build/src/bindings/python/nixl-meta/nixl-*.whl /opt/dynamo/wheelhouse/nixl/
 
 # Place wheels in /opt/dynamo/wheelhouse unconditionally — dev/local-dev
 # images install from source and skip the pip install RUN below but still
@@ -142,7 +139,11 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     export UV_CACHE_DIR=/root/.cache/uv && \
     # Dynamo wheels — --no-deps preserves upstream's solve.
     uv pip install --no-deps /opt/dynamo/wheelhouse/ai_dynamo_runtime*.whl && \
-    uv pip install --no-deps /opt/dynamo/wheelhouse/ai_dynamo*any.whl
+    uv pip install --no-deps /opt/dynamo/wheelhouse/ai_dynamo*any.whl && \
+    # Phase-3 NIXL wheels (cu12 CUDA wheel + metapackage facade). Both wheels
+    # are produced by wheel_builder; the metapackage exposes `nixl._api` and
+    # the cu12 wheel ships libnixl.so. --no-deps consistent with above.
+    uv pip install --no-deps /opt/dynamo/wheelhouse/nixl/nixl*.whl
 {% endif %}
 
 # Pull /workspace_src (incl. ATTRIBUTION/LICENSE) from the transport stage.
@@ -177,7 +178,10 @@ ENV DYNAMO_HOME=/workspace \
     VIRTUAL_ENV=/opt/dynamo/venv \
     PATH=/opt/dynamo/venv/bin:/usr/local/bin/etcd:${PATH} \
     PYTHONPATH=/opt/megatron-lm:${PYTHONPATH:-} \
-    LD_LIBRARY_PATH=/opt/dynamo/nixl-libs:${LD_LIBRARY_PATH:-}
+    NIXL_PREFIX=/opt/nvidia/nvda_nixl \
+    NIXL_LIB_DIR=/opt/nvidia/nvda_nixl/lib64 \
+    NIXL_PLUGIN_DIR=/opt/nvidia/nvda_nixl/lib64/plugins \
+    LD_LIBRARY_PATH=/opt/nvidia/nvda_nixl/lib64:/opt/nvidia/nvda_nixl/lib64/plugins:/usr/local/ucx/lib:/usr/local/ucx/lib/ucx:${LD_LIBRARY_PATH:-}
 
 WORKDIR /workspace
 

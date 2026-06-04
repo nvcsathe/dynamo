@@ -54,15 +54,15 @@ docker run --rm dynamo:phase3-megatron-runtime python -c \
     "from nixl._api import nixl_agent; print('nixl OK')"
 ```
 
-And confirm the loader path resolves to the auditwheel libs:
+And confirm the native lib + UCX paths landed:
 
 ```bash
 docker run --rm dynamo:phase3-megatron-runtime sh -c \
-    'ls -la /opt/dynamo/nixl-libs/ && echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"'
+    'ls /opt/nvidia/nvda_nixl/lib64/libnixl* && ls /usr/local/ucx/lib/libucp* && echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"'
 ```
 
-Expect at least `libnixl.so.*` listed, and `LD_LIBRARY_PATH` containing
-`/opt/dynamo/nixl-libs`.
+Expect `libnixl.so*` under `/opt/nvidia/nvda_nixl/lib64/`, `libucp.so*` under
+`/usr/local/ucx/lib/`, and `LD_LIBRARY_PATH` containing both prefixes.
 
 ## Topology
 
