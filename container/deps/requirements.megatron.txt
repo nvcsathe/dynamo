@@ -16,12 +16,13 @@
 # Megatron imports `accelerate` from megatron.training during init.
 accelerate
 # NIXL — Phase-3 disaggregated KV transport. Megatron's kv_transfer.py imports
-# `nixl._api`. The PyPI wheel bundles the native libnixl.so + UCX adapters via
-# auditwheel, so Python consumers don't need the rust-style LD_LIBRARY_PATH
-# dance vllm_runtime.Dockerfile does (that's only for Rust callers).
-# Pin minor floor at the version the disagg engine_client surface was tested
-# against; upgrade in tandem with the dynamo runtime image.
-nixl>=0.3
+# `nixl._api`. We pin the CUDA-specific wheel (`nixl-cu12`) explicitly because
+# we install with `--no-deps`: PyPI's bare `nixl` is a metapackage that
+# *depends on* nixl-cu12/13 for the actual `libnixl.so` payload, and with
+# --no-deps that transitive pull is skipped. Wheel name matches the
+# `.nixl_cu12.mesonpy.libs/` auditwheel-bundled lib dir the Dockerfile
+# symlinks into LD_LIBRARY_PATH. Match the CUDA major to the NGC PyTorch base.
+nixl-cu12>=0.3
 # Datasets — imported by dist_checkpointing under some code paths.
 datasets
 # Megatron uses einops heavily in attention/MLP modules.

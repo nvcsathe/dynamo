@@ -106,7 +106,17 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
 # shells (which is what pyxis srun + orchestrate.sh launches into).
 RUN SITE_PACKAGES="$(/opt/dynamo/venv/bin/python -c 'import site; print(site.getsitepackages()[0])')" \
     && NIXL_LIBS_DIR="$(ls -d ${SITE_PACKAGES}/.nixl_cu*.mesonpy.libs 2>/dev/null | head -1)" \
-    && [ -n "$NIXL_LIBS_DIR" ] || { echo "nixl libs not found under $SITE_PACKAGES — wheel install failed?"; exit 1; } \
+    && if [ -z "$NIXL_LIBS_DIR" ]; then \
+        echo "FATAL: no .nixl_cu*.mesonpy.libs under $SITE_PACKAGES."; \
+        echo "Installed nixl-* packages:"; \
+        ls -d ${SITE_PACKAGES}/nixl* 2>/dev/null || echo "  (none)"; \
+        echo "All hidden .libs/.dist-info dirs under site-packages:"; \
+        ls -d ${SITE_PACKAGES}/.*.libs ${SITE_PACKAGES}/nixl*.dist-info 2>/dev/null || echo "  (none)"; \
+        echo "Hint: requirements.megatron.txt must pin the CUDA-suffixed wheel"; \
+        echo "(e.g. nixl-cu12), not the bare 'nixl' metapackage — with --no-deps"; \
+        echo "the metapackage doesn't pull the libnixl.so wheel transitively."; \
+        exit 1; \
+    fi \
     && ln -sf "$NIXL_LIBS_DIR" /opt/dynamo/nixl-libs
 ENV LD_LIBRARY_PATH=/opt/dynamo/nixl-libs:${LD_LIBRARY_PATH:-}
 
