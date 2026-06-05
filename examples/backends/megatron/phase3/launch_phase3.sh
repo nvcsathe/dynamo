@@ -36,7 +36,13 @@ set -euo pipefail
 [[ -d "$STAGE"   ]] || { echo "STAGE not found: $STAGE"        >&2; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DYNAMO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
+# Default to the dynamo checkout this launcher belongs to. Override with
+# DYNAMO_LOCAL_DEV=/some/other/path if you want to mount a different
+# checkout (e.g. one that has Phase-3 dynamo code while this launcher
+# was vendored from somewhere older).
+DYNAMO_ROOT="${DYNAMO_LOCAL_DEV:-$(cd "$SCRIPT_DIR/../../../.." && pwd)}"
+[[ -d "$DYNAMO_ROOT" ]] || { echo "DYNAMO_ROOT not a dir: $DYNAMO_ROOT" >&2; exit 1; }
+echo "[launch] dynamo source mount: $DYNAMO_ROOT -> /workspace"
 
 MOUNTS="$STAGE:$STAGE,$DYNAMO_ROOT:/workspace"
 if [[ -n "${MEGATRON_LOCAL_DEV:-}" ]]; then

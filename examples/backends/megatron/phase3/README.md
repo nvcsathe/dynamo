@@ -75,6 +75,8 @@ nats + etcd ── dynamo.frontend
                               └── Megatron DECODE engine  (TP=N, GPUs N..2N-1)
                                     - role=decode, NIXL :7001
                                     - prefix caching ENABLED
+                                      (via --inference-dynamic-batching-prefix-caching;
+                                       required for the prefill-skip path)
 ```
 
 A request flows: frontend → `PrefillRouter` → prefill worker → prefill engine

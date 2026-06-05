@@ -169,7 +169,7 @@ log "starting Megatron DECODE coordinator (TP=$TP_DECODE, GPUs=$DECODE_GPUS)..."
             --inference-coordinator-port "$COORD_PORT_DECODE" \
             --tensor-model-parallel-size "$TP_DECODE" \
             --pipeline-model-parallel-size 1 \
-            --enable-prefix-caching \
+            --inference-dynamic-batching-prefix-caching \
             --load "$MODEL_CHECKPOINT" \
             --tokenizer-type HuggingFaceTokenizer \
             --tokenizer-model "$TOKENIZER_MODEL" \

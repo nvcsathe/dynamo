@@ -23,6 +23,9 @@ class MegatronEngineClient:
     """Async-iterator wrapper around InferenceClient.add_request_streaming."""
 
     def __init__(self, coordinator_addr: str):
+        # Stash the address as a string so start()'s log line is greppable;
+        # the raw ZMQ socket repr doesn't show the connect target.
+        self._coordinator_addr = coordinator_addr
         self._client = InferenceClient(coordinator_addr, deserialize=False)
         self._started = False
 
@@ -31,7 +34,10 @@ class MegatronEngineClient:
             return
         self._client.start()
         self._started = True
-        logger.info("MegatronEngineClient connected to %s", self._client.socket)
+        logger.info(
+            "MegatronEngineClient connected to coordinator at %s",
+            self._coordinator_addr,
+        )
 
     async def prefill_for_handoff(
         self,
