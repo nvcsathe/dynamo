@@ -22,6 +22,14 @@
 #   MASTER_PORT_PREFILL, MASTER_PORT_DECODE        (default 29500, 29501)
 #   MEGATRON_LOCAL_DEV
 #
+# UCX transport / logging (force-set in this script, use _OVERRIDE suffix to change):
+#   UCX_TLS_OVERRIDE            transport allow-list (default: cuda_ipc,cuda_copy,cma,shm,self)
+#                               TCP is intentionally excluded — it cannot handle VRAM addresses.
+#                               The NGC base image bakes in UCX_TLS=tcp; this script overrides it.
+#   UCX_MEMTYPE_CACHE_OVERRIDE  set to "n" by default to avoid early-init misclassification
+#   UCX_LOG_LEVEL_OVERRIDE      UCX log verbosity (default: info — set to warn once stable)
+#   UCX_LOG_FILE_OVERRIDE       log path; UCX expands %p to PID (default: /tmp/ucx_%p.log)
+#
 # If MEGATRON_LOCAL_DEV is set, the host directory it points to is mounted
 # over /opt/megatron-lm so you can edit InferenceClient / coordinator /
 # kv_transfer.py code without rebuilding the image.
@@ -59,8 +67,29 @@ EXPORT_VARS="$EXPORT_VARS,COORD_PORT_PREFILL,COORD_PORT_DECODE"
 EXPORT_VARS="$EXPORT_VARS,NIXL_PORT_PREFILL,NIXL_PORT_DECODE"
 EXPORT_VARS="$EXPORT_VARS,MASTER_PORT_PREFILL,MASTER_PORT_DECODE"
 
+# UCX transport constraints and diagnostic logging.
+#
+# The NGC base image bakes in UCX_TLS=tcp to keep NCCL off UCX-RDMA paths.
+# That setting is fatal for NIXL: uct_tcp_ep_am_bcopy on the prefill side
+# tries to CPU-memcpy from VRAM addresses when handling decode's GET request
+# → SIGSEGV on aarch64. We must force-override it unconditionally (no :=
+# setdefault — that silently skips if the var is already set to "tcp").
+#
+# Passing the override both as an exported shell var and via srun --env
+# ensures pyxis applies it on top of the image ENV layer.
+#
+# UCX_LOG_LEVEL=info + UCX_LOG_FILE captures which transport UCX selects.
+# Grep the log after a run: grep -iE 'tls|cuda|tcp|selected' /tmp/ucx_*.log
+# Set UCX_LOG_LEVEL=warn once cuda_icp is confirmed as the chosen transport.
+UCX_TLS="${UCX_TLS_OVERRIDE:-cuda_ipc,cuda_copy,tcp,shm,cma,self}"
+UCX_MEMTYPE_CACHE="${UCX_MEMTYPE_CACHE_OVERRIDE:-n}"
+UCX_LOG_LEVEL="${UCX_LOG_LEVEL_OVERRIDE:-info}"
+UCX_LOG_FILE="${UCX_LOG_FILE_OVERRIDE:-/tmp/ucx_%p.log}"
+export UCX_TLS UCX_MEMTYPE_CACHE UCX_LOG_LEVEL UCX_LOG_FILE
+
 echo "[launch] container: $DMG_SQSH"
 echo "[launch] mounts:    $MOUNTS"
+echo "[launch] UCX_TLS=$UCX_TLS  UCX_LOG_FILE=$UCX_LOG_FILE"
 echo "[launch] expect 'PHASE3_READY' on stdout when ready"
 echo
 
@@ -70,5 +99,5 @@ exec srun \
     --container-name=dmg \
     --container-mounts="$MOUNTS" \
     --container-workdir=/workspace \
-    --export="ALL,$EXPORT_VARS" \
+    --export="ALL,$EXPORT_VARS,UCX_TLS=$UCX_TLS,UCX_MEMTYPE_CACHE=$UCX_MEMTYPE_CACHE,UCX_LOG_LEVEL=$UCX_LOG_LEVEL,UCX_LOG_FILE=$UCX_LOG_FILE" \
     bash /workspace/examples/backends/megatron/phase3/orchestrate.sh

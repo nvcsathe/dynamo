@@ -28,8 +28,26 @@
 
 set -uo pipefail
 
+# The NGC base image bakes UCX_TLS=tcp. Override it here — inside the
+# container, after image ENV is applied — so every child process (torchrun,
+# python -m dynamo.megatron) inherits the correct value. Using srun --export
+# does not reliably win against the image-layer value on this pyxis version.
+#
+# TCP cannot handle VRAM addresses: uct_tcp_ep_am_bcopy on the prefill side
+# tries a CPU memcpy from GPU memory when serving decode's NIXL GET → SIGSEGV.
+# cuda_ipc is the zero-copy NVLink path; cuda_copy is the safe fallback.
+# tcp is included for UCX's connection manager (endpoint wireup handshake).
+# cuda_ipc / cuda_copy are included so UCX has CUDA-capable memory domains:
+# when NIXL registers VRAM via ucp_mem_map, UCX binds it to the CUDA MD and
+# selects cuda_ipc/cuda_copy for transfers — preventing the fallback to TCP
+# which crashes (uct_tcp_ep_am_bcopy CPU-memcpy from VRAM → SIGSEGV).
+export UCX_TLS="${UCX_TLS_OVERRIDE:-cuda_ipc,cuda_copy,tcp,shm,cma,self}"
+export UCX_MEMTYPE_CACHE="${UCX_MEMTYPE_CACHE_OVERRIDE:-n}"
+export UCX_LOG_LEVEL="${UCX_LOG_LEVEL_OVERRIDE:-info}"
+export UCX_LOG_FILE="${UCX_LOG_FILE_OVERRIDE:-/tmp/ucx_%p.log}"
+
 STAGE="${STAGE:-/lustre/fsw/portfolios/nemotron/users/csathe}"
-MODEL_DIR="${MODEL_DIR:-llama3.1-8b-instruct-mcore}"
+MODEL_DIR="${MODEL_DIR:-llama3.1-8b-mcore}"
 MODEL_CHECKPOINT="${MODEL_CHECKPOINT:-$STAGE/models/${MODEL_DIR}}"
 TOKENIZER_MODEL="${TOKENIZER_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-llama-3.1-8b-instruct}"
