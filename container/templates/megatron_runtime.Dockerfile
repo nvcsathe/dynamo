@@ -121,6 +121,8 @@ ${NIXL_LIB_DIR}:\
 ${NIXL_PLUGIN_DIR}:\
 /usr/local/ucx/lib:\
 /usr/local/ucx/lib/ucx:\
+/usr/local/cuda/lib64:\
+/usr/local/cuda/compat:\
 ${LD_LIBRARY_PATH:-}
 
 # Native NIXL + UCX runtime libs, and the locally-built wheels.
@@ -181,7 +183,7 @@ ENV DYNAMO_HOME=/workspace \
     NIXL_PREFIX=/opt/nvidia/nvda_nixl \
     NIXL_LIB_DIR=/opt/nvidia/nvda_nixl/lib64 \
     NIXL_PLUGIN_DIR=/opt/nvidia/nvda_nixl/lib64/plugins \
-    LD_LIBRARY_PATH=/opt/nvidia/nvda_nixl/lib64:/opt/nvidia/nvda_nixl/lib64/plugins:/usr/local/ucx/lib:/usr/local/ucx/lib/ucx:${LD_LIBRARY_PATH:-}
+    LD_LIBRARY_PATH=/opt/nvidia/nvda_nixl/lib64:/opt/nvidia/nvda_nixl/lib64/plugins:/usr/local/ucx/lib:/usr/local/ucx/lib/ucx:/usr/local/cuda/lib64:/usr/local/cuda/compat:${LD_LIBRARY_PATH:-}
 
 WORKDIR /workspace
 
