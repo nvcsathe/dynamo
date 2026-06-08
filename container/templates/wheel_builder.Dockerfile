@@ -239,7 +239,7 @@ RUN ARCH_ALT=$([ "${TARGETARCH}" = "amd64" ] && echo "x86_64" || echo "aarch64")
     rpm -Uvh --nodeps gdrcopy-kmod-*.el8.noarch.rpm && \
     rpm -Uvh --nodeps gdrcopy-*.el8.${ARCH_ALT}.rpm && \
     rpm -Uvh --nodeps gdrcopy-devel-*.el8.noarch.rpm && \
-    ls /usr/local/include/gdrapi.h  # fail fast if devel headers not installed
+    ls /usr/include/gdrapi.h  # fail fast if devel headers not installed
 {% endif %}
 
 # sccache binary is pre-installed in dynamo_base; stage it off-PATH so
@@ -348,7 +348,7 @@ RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token 
         --with-cuda=/usr/local/cuda \
         --with-verbs                \
         --with-dm                   \
-        --with-gdrcopy=/usr/local   \
+        --with-gdrcopy=/usr         \
         --with-efa                  \
         --enable-mt;                 \
     elif [ "$DEVICE" = "cpu" ]; then  \
