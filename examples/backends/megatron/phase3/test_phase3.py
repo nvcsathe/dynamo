@@ -177,7 +177,7 @@ def test_decode_engine_imported_kv_and_skipped_prefill(stack):
     This is the load-bearing Phase-3 assertion: tokens coming back from the
     frontend (test above) only prove the response works; this proves the
     decode side actually went through ``add_request_with_kv_handoff``
-    (NIXL pull + prefix-cache match → 1-token prefill) rather than the
+    (NIXL pull + prefix-cache match → short decode-side prefill) rather than the
     Phase-0 ``add_request`` (full prompt re-prefill).
     """
     _send_completion(stack, prompt="Phase-3 decode marker probe.", max_tokens=8)

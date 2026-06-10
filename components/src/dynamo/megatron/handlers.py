@@ -77,32 +77,42 @@ class DecodeWorkerHandler:
             disagg = prefill_result.get("disaggregated_params") or {}
             kv_meta = disagg.get("kv_meta") or {}
             src_block_ids = list(disagg.get("block_ids") or [])
-            first_token = disagg.get("first_token")
+            release = disagg.get("release") or {}
+            release_coordinator_addr = release.get("coordinator_addr")
+            release_request_id = release.get("request_id")
             logger.debug(
                 "Megatron decode handler: %d input tokens, %d imported KV blocks",
                 len(token_ids),
                 len(src_block_ids),
             )
-            request_id_for_release: int | None = None
-            try:
-                async for chunk in self.engine_client.decode_with_kv(
-                    token_ids,
-                    sampling_params,
-                    kv_meta,
-                    src_block_ids,
-                    first_token,
+            released_prefill = False
+            async for chunk in self.engine_client.decode_with_kv(
+                token_ids,
+                sampling_params,
+                kv_meta,
+                src_block_ids,
+            ):
+                if (
+                    not released_prefill
+                    and release_coordinator_addr is not None
+                    and release_request_id is not None
                 ):
-                    response: dict[str, Any] = {"token_ids": chunk["new_tokens"]}
-                    if chunk["finished"]:
-                        response["finish_reason"] = "stop"
-                        reply = chunk.get("reply") or {}
-                        request_id_for_release = reply.get("request_id")
-                    yield response
-            finally:
-                # Always tell the prefill engine to release its pinned blocks,
-                # whether decode finished normally or errored out.
-                if request_id_for_release is not None:
-                    self.engine_client.release_handoff(request_id_for_release)
+                    self.engine_client.release_remote_handoff(
+                        str(release_coordinator_addr),
+                        int(release_request_id),
+                    )
+                    released_prefill = True
+                    logger.debug(
+                        "Megatron decode handler released prefill KV blocks "
+                        "request_id=%s via %s",
+                        release_request_id,
+                        release_coordinator_addr,
+                    )
+
+                response: dict[str, Any] = {"token_ids": chunk["new_tokens"]}
+                if chunk["finished"]:
+                    response["finish_reason"] = "stop"
+                yield response
             return
 
         # Aggregated mode — Phase-0 path, unchanged.
@@ -140,7 +150,13 @@ class PrefillWorkerHandler:
 
         sampling_params = _build_sampling_params(request)
         reply = await self.engine_client.prefill_for_handoff(token_ids, sampling_params)
-        disaggregated_params = reply.get("disaggregated_params") or {}
+        disaggregated_params = dict(reply.get("disaggregated_params") or {})
+        prefill_request_id = disaggregated_params.get("request_id", reply.get("request_id"))
+        if prefill_request_id is not None:
+            disaggregated_params["release"] = {
+                "coordinator_addr": self.config.coordinator_addr,
+                "request_id": int(prefill_request_id),
+            }
 
         # PrefillRouter looks at top-level disaggregated_params; the rest of
         # the dict mirrors the frontend's expected ChatCompletion-ish shape so
@@ -150,7 +166,4 @@ class PrefillWorkerHandler:
             "disaggregated_params": disaggregated_params,
             "finish_reason": "stop",
         }
-        first_token = disaggregated_params.get("first_token")
-        if first_token is not None:
-            response["token_ids"] = [int(first_token)]
         yield response

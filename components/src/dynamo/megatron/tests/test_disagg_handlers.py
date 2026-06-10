@@ -8,13 +8,13 @@ calls and yields deterministic chunks; no live coordinator, no NIXL, no
 network. They cover:
 
 1. ``PrefillWorkerHandler`` runs one prefill call and emits a single chunk
-   carrying ``disaggregated_params`` (plus the first token).
+   carrying ``disaggregated_params`` only.
 2. ``DecodeWorkerHandler`` in ``role=decode`` rejects requests without
    ``prefill_result``.
 3. ``DecodeWorkerHandler`` in ``role=decode`` passes ``prefill_result`` fields
    to ``decode_with_kv`` correctly and emits the streamed chunks.
-4. ``DecodeWorkerHandler`` in ``role=decode`` calls ``release_handoff`` after
-   the decode completes (so the prefill engine can free its pinned blocks).
+4. ``DecodeWorkerHandler`` in ``role=decode`` releases prefill-owned KV after
+   decode has started, so the prefill engine can make its pinned blocks reusable.
 """
 
 from __future__ import annotations
@@ -51,16 +51,14 @@ class _FakeDecodeClient:
         self.chunks = chunks
         self.last_call: dict[str, Any] | None = None
         self.released: list[int] = []
+        self.remote_released: list[tuple[str, int]] = []
 
-    async def decode_with_kv(
-        self, token_ids, sampling_params, kv_meta, src_block_ids, first_token
-    ):
+    async def decode_with_kv(self, token_ids, sampling_params, kv_meta, src_block_ids):
         self.last_call = {
             "token_ids": list(token_ids),
             "sampling_params": sampling_params,
             "kv_meta": kv_meta,
             "src_block_ids": list(src_block_ids),
-            "first_token": first_token,
         }
         for chunk in self.chunks:
             yield chunk
@@ -68,20 +66,23 @@ class _FakeDecodeClient:
     def release_handoff(self, request_id: int) -> None:
         self.released.append(int(request_id))
 
+    def release_remote_handoff(self, coordinator_addr: str, request_id: int) -> None:
+        self.remote_released.append((coordinator_addr, int(request_id)))
+
 
 # ---------------------------------------------------------------------------
 # Prefill
 # ---------------------------------------------------------------------------
 
 
-async def test_prefill_handler_emits_disaggregated_params_and_first_token():
+async def test_prefill_handler_emits_disaggregated_params_without_tokens():
     engine = _FakePrefillClient(
         reply={
             "request_id": 42,
             "disaggregated_params": {
+                "request_id": 314,
                 "block_ids": [3, 4, 5],
                 "kv_meta": {"agent_name": "prefill-rank0", "host": "h", "port": 9000},
-                "first_token": 17,
             },
         }
     )
@@ -93,24 +94,26 @@ async def test_prefill_handler_emits_disaggregated_params_and_first_token():
     assert len(responses) == 1
     resp = responses[0]
     assert resp["finish_reason"] == "stop"
-    assert resp["token_ids"] == [17]
+    assert resp["token_ids"] == []
+    assert resp["disaggregated_params"]["request_id"] == 314
+    assert resp["disaggregated_params"]["release"] == {
+        "coordinator_addr": "tcp://127.0.0.1:0",
+        "request_id": 314,
+    }
     assert resp["disaggregated_params"]["block_ids"] == [3, 4, 5]
     assert resp["disaggregated_params"]["kv_meta"]["agent_name"] == "prefill-rank0"
-    assert resp["disaggregated_params"]["first_token"] == 17
 
     # Engine sees the full prompt verbatim.
     assert engine.last_call["token_ids"] == [1, 2, 3, 4, 5, 6, 7, 8]
 
 
-async def test_prefill_handler_omits_token_when_first_token_missing():
-    """A reply without first_token still produces a valid response (empty token_ids)."""
+async def test_prefill_handler_omits_tokens_for_empty_handoff_meta():
     engine = _FakePrefillClient(
         reply={
             "request_id": 99,
             "disaggregated_params": {
                 "block_ids": [1],
                 "kv_meta": {},
-                "first_token": None,
             },
         }
     )
@@ -148,7 +151,10 @@ async def test_decode_role_passes_handoff_meta_to_engine_and_streams():
             "disaggregated_params": {
                 "block_ids": [9, 10],
                 "kv_meta": {"agent_name": "prefill-rank0"},
-                "first_token": 17,
+                "release": {
+                    "coordinator_addr": "tcp://prefill.example:5555",
+                    "request_id": 1234,
+                },
             }
         },
     }
@@ -162,16 +168,16 @@ async def test_decode_role_passes_handoff_meta_to_engine_and_streams():
     # Engine received the right handoff meta.
     assert engine.last_call["src_block_ids"] == [9, 10]
     assert engine.last_call["kv_meta"]["agent_name"] == "prefill-rank0"
-    assert engine.last_call["first_token"] == 17
     assert engine.last_call["sampling_params"].temperature == pytest.approx(0.5)
     assert engine.last_call["sampling_params"].num_tokens_to_generate == 8
 
-    # Release issued for the right request_id after the stream ended.
-    assert engine.released == [77]
+    # Release issued for the prefill request as soon as decode starts.
+    assert engine.released == []
+    assert engine.remote_released == [("tcp://prefill.example:5555", 1234)]
 
 
-async def test_decode_role_releases_handoff_even_on_engine_error():
-    """If the engine stream raises mid-decode, the handler still releases."""
+async def test_decode_role_releases_handoff_after_first_chunk_on_engine_error():
+    """If decode errors after import, the prefill handoff has already been released."""
 
     class _ExplodingClient(_FakeDecodeClient):
         async def decode_with_kv(self, *args, **kwargs):
@@ -187,7 +193,10 @@ async def test_decode_role_releases_handoff_even_on_engine_error():
             "disaggregated_params": {
                 "block_ids": [1],
                 "kv_meta": {},
-                "first_token": 5,
+                "release": {
+                    "coordinator_addr": "tcp://prefill.example:5555",
+                    "request_id": 5678,
+                },
             }
         },
     }
@@ -196,9 +205,5 @@ async def test_decode_role_releases_handoff_even_on_engine_error():
         async for _ in handler.generate(request, context=None):
             pass
 
-    # The decode never produced a `finished=True` chunk → no request_id was
-    # captured → no release. Document this minor wart: production callers
-    # should also drive release on timeout / abort paths from the frontend
-    # side. (Tracked under the "Block release on decode failure" risk in the
-    # Phase-3 design memo.)
     assert engine.released == []
+    assert engine.remote_released == [("tcp://prefill.example:5555", 5678)]

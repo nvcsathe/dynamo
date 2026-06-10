@@ -80,11 +80,12 @@ nats + etcd ── dynamo.frontend
 ```
 
 A request flows: frontend → `PrefillRouter` → prefill worker → prefill engine
-runs 1-token prefill, pins KV blocks, returns `disaggregated_params` → frontend
+runs prefill only, pins KV blocks, returns `disaggregated_params` → frontend
 forwards `prefill_result` → decode worker → decode engine NIXL-pulls the KV
 blocks, registers their hashes, then `add_request` finds them as
-prefix-matched → only 1 token of prefill on the decode side → tokens stream
-back.
+prefix-matched → decode worker tells the prefill coordinator to unpin the
+source KV blocks so they are LRU-reusable → decode computes the first output
+token and streams tokens back.
 
 ## Run
 
@@ -156,7 +157,8 @@ subjects (`dynamo.prefill.generate` and `dynamo.backend.generate`).
 - Phase-1 (per-step metrics PUB) and Phase-2 (KV-event PUB) — stashed under
   `disagg/.stashed_phase1_phase2/`. Independent of Phase-3 and can be
   re-applied any time.
-- Block-release on decode failure: the handler emits `RELEASE_KV` only after
-  a successful stream completion. A torn TCP connection mid-decode leaves
-  prefill blocks pinned until engine restart. See the `release_handoff_blocks`
-  TODO in `engines/dynamic_engine.py`.
+- Block-release before decode starts: the handler emits `RELEASE_KV` only after
+  the decode engine returns its first response, which proves the KV pull
+  completed. Under LRU prefix caching, released prefill blocks remain cached
+  and reusable. A failure during the pull itself can still leave prefill blocks
+  pinned until engine restart.
