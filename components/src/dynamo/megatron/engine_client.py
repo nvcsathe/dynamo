@@ -80,6 +80,7 @@ class MegatronEngineClient:
         sampling_params: SamplingParams,
         kv_meta: dict[str, Any],
         src_block_ids: list[int],
+        first_token: int | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Phase-3 decode: submit a request that imports KV from a prefill peer.
 
@@ -89,6 +90,10 @@ class MegatronEngineClient:
         """
         if not self._started:
             raise RuntimeError("MegatronEngineClient.start() must be called first")
+        if first_token is not None:
+            logger.debug(
+                "MegatronEngineClient ignoring deprecated first_token handoff field"
+            )
         iterator = self._client.add_request_with_kv_handoff(
             token_ids,
             sampling_params,
