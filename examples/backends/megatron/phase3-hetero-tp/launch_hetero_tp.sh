@@ -22,6 +22,13 @@
 #   NIXL_PORT_PREFILL, NIXL_PORT_DECODE       (default 7000, 7001)
 #   MASTER_PORT_PREFILL, MASTER_PORT_DECODE   (default 29500, 29501)
 #   MEGATRON_LOCAL_DEV
+#   DYNAMO_MEGATRON_LOCAL_DEV  host dir to overlay onto the installed
+#                              dynamo.megatron subpackage for live worker-code
+#                              edits without rebuilding the sqsh. The package is
+#                              baked into the image venv, so the /workspace mount
+#                              alone does NOT override what `python -m
+#                              dynamo.megatron` imports. Set this to
+#                              $DYNAMO_ROOT/components/src/dynamo/megatron.
 #
 # UCX transport / logging (force-set in this script, use _OVERRIDE suffix to change):
 #   UCX_TLS_OVERRIDE            transport allow-list (default: cuda_ipc,cuda_copy,tcp,shm,cma,self)
@@ -57,6 +64,23 @@ if [[ -n "${MEGATRON_LOCAL_DEV:-}" ]]; then
     [[ -d "$MEGATRON_LOCAL_DEV" ]] || { echo "MEGATRON_LOCAL_DEV not a dir: $MEGATRON_LOCAL_DEV" >&2; exit 1; }
     MOUNTS="$MOUNTS,$MEGATRON_LOCAL_DEV:/opt/megatron-lm"
     echo "[launch] live Megatron mount: $MEGATRON_LOCAL_DEV -> /opt/megatron-lm"
+fi
+
+# The dynamo.megatron package is pip-installed into the image venv at build
+# time, so the /workspace mount above does NOT change what `python -m
+# dynamo.megatron` imports — it loads from site-packages. To live-edit worker
+# code (handlers.py, engine_client.py, args.py) without rebuilding the sqsh,
+# overlay just this subpackage from the host onto the installed location. This
+# is surgical: it shadows only dynamo.megatron, leaving the compiled
+# dynamo.runtime / dynamo._core / dynamo.frontend in the venv intact, so it
+# won't break the namespace package. DMG_PKG_DST embeds the venv's python
+# version — update it if the base image's python changes.
+#   export DYNAMO_MEGATRON_LOCAL_DEV=$DYNAMO_ROOT/components/src/dynamo/megatron
+DMG_PKG_DST="/opt/dynamo/venv/lib/python3.12/site-packages/dynamo/megatron"
+if [[ -n "${DYNAMO_MEGATRON_LOCAL_DEV:-}" ]]; then
+    [[ -d "$DYNAMO_MEGATRON_LOCAL_DEV" ]] || { echo "DYNAMO_MEGATRON_LOCAL_DEV not a dir: $DYNAMO_MEGATRON_LOCAL_DEV" >&2; exit 1; }
+    MOUNTS="$MOUNTS,$DYNAMO_MEGATRON_LOCAL_DEV:$DMG_PKG_DST"
+    echo "[launch] live dynamo.megatron mount: $DYNAMO_MEGATRON_LOCAL_DEV -> $DMG_PKG_DST"
 fi
 
 # Forward env that orchestrate.sh consumes. HF_TOKEN is needed for gated
