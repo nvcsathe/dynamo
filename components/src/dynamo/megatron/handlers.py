@@ -40,6 +40,16 @@ def _build_sampling_params(request: dict[str, Any]) -> SamplingParams:
         params.top_k = int(top_k)
     if (max_tokens := stop_conditions.get("max_tokens")) is not None:
         params.num_tokens_to_generate = int(max_tokens)
+
+    # temperature==0 means greedy. Megatron's HTTP endpoints (completions.py /
+    # chat_completions.py) translate this to top_k=1, which TorchSampling
+    # short-circuits to argmax. The Dynamo path bypasses those endpoints, so we
+    # must replicate the conversion here. Without it torch_sampling does
+    # `logits.div_(0.0)` -> inf -> softmax -> nan, and torch.multinomial aborts
+    # with "probability tensor contains either inf, nan or element < 0".
+    if params.temperature == 0.0:
+        params.top_k = 1
+        params.top_p = 0.0
     return params
 
 
