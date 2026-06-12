@@ -19,15 +19,26 @@
 set -uo pipefail
 source /tmp/phase3_hetero.env
 
-PROMPT='Explain in two sentences why the sky is blue.'
-echo "== prefill TP=$TP_PREFILL  decode TP=$TP_DECODE =="
+# Sampling temperature. Default 0 (greedy) gives deterministic output so the
+# token sequence can be diffed against a matched-TP stack for the gold-standard
+# correctness check. BUT greedy=0 only works once the worker maps temperature==0
+# to top_k=1 (the argmax fast-path); the stock dynamo.megatron build forwards
+# temperature=0 straight into torch_sampling, which then does div_(0.0) -> inf
+# -> nan -> a torch.multinomial CUDA device-side assert on the prefill engine.
+# To exercise the disagg/KV-reshard path without that fix loaded, override with
+# a positive temperature, e.g.  TEMPERATURE=0.7 ./verify_hetero_tp.sh
+# (output is then non-deterministic, so only the import check below is exact).
+TEMPERATURE="${TEMPERATURE:-0}"
 
-# 1. Greedy completion. Long-enough prompt to span >1 KV block.
+PROMPT='Explain in two sentences why the sky is blue.'
+echo "== prefill TP=$TP_PREFILL  decode TP=$TP_DECODE  temperature=$TEMPERATURE =="
+
+# 1. Completion. Long-enough prompt to span >1 KV block.
 RESP=$(curl -sf "$PHASE3_FRONTEND_URL/v1/chat/completions" \
     -H 'Content-Type: application/json' \
     -d "{\"model\":\"$PHASE3_MODEL_NAME\",
          \"messages\":[{\"role\":\"user\",\"content\":\"$PROMPT\"}],
-         \"max_tokens\":64,\"temperature\":0,\"stream\":false}") \
+         \"max_tokens\":64,\"temperature\":$TEMPERATURE,\"stream\":false}") \
   || { echo "FAIL: request errored"; exit 1; }
 
 TEXT=$(echo "$RESP" | python -c 'import sys,json; print(json.load(sys.stdin)["choices"][0]["message"]["content"])') \

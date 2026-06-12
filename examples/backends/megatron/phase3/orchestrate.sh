@@ -53,10 +53,13 @@ TOKENIZER_MODEL="${TOKENIZER_MODEL:-meta-llama/Llama-3.1-8B-Instruct}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-llama-3.1-8b-instruct}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-4096}"
 
-# Disagg topology (must match — see [[project_megatron_disagg_phases]]).
+# Disagg topology. Heterogeneous TP and PP are supported: prefill and decode
+# may use different TP and/or PP values. Total GPU count is
+# (TP_PREFILL×PP_PREFILL) + (TP_DECODE×PP_DECODE).
 TP_PREFILL="${TP_PREFILL:-1}"
 TP_DECODE="${TP_DECODE:-1}"
-[[ "$TP_PREFILL" == "$TP_DECODE" ]] || { echo "TP_PREFILL must equal TP_DECODE for Phase-3"; exit 1; }
+PP_PREFILL="${PP_PREFILL:-1}"
+PP_DECODE="${PP_DECODE:-1}"
 
 HTTP_PORT="${HTTP_PORT:-8100}"
 COORD_PORT_PREFILL="${COORD_PORT_PREFILL:-5555}"
@@ -149,16 +152,18 @@ MODEL_ARGS=(
     --bf16
 )
 
-# Compute GPU assignments. Prefill gets GPUs [0, TP_PREFILL); decode gets
-# [TP_PREFILL, TP_PREFILL+TP_DECODE).
-PREFILL_GPUS=$(seq -s, 0 $((TP_PREFILL-1)))
-DECODE_GPUS=$(seq -s, $TP_PREFILL $((TP_PREFILL+TP_DECODE-1)))
+# Compute GPU assignments. Prefill gets GPUs [0, TP_PREFILL×PP_PREFILL);
+# decode gets the next TP_DECODE×PP_DECODE GPUs.
+PREFILL_NPROC=$((TP_PREFILL * PP_PREFILL))
+DECODE_NPROC=$((TP_DECODE  * PP_DECODE))
+PREFILL_GPUS=$(seq -s, 0 $((PREFILL_NPROC - 1)))
+DECODE_GPUS=$(seq -s, $PREFILL_NPROC $((PREFILL_NPROC + DECODE_NPROC - 1)))
 
-log "starting Megatron PREFILL coordinator (TP=$TP_PREFILL, GPUs=$PREFILL_GPUS)..."
+log "starting Megatron PREFILL coordinator (TP=$TP_PREFILL PP=$PP_PREFILL, GPUs=$PREFILL_GPUS)..."
 (
     cd /opt/megatron-lm
     CUDA_VISIBLE_DEVICES="$PREFILL_GPUS" exec python -m torch.distributed.run \
-        --nnodes=1 --nproc-per-node="$TP_PREFILL" --node-rank=0 \
+        --nnodes=1 --nproc-per-node="$PREFILL_NPROC" --node-rank=0 \
         --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT_PREFILL" \
         tools/run_dynamic_text_generation_server.py \
             --frontend dynamo \
@@ -166,7 +171,7 @@ log "starting Megatron PREFILL coordinator (TP=$TP_PREFILL, GPUs=$PREFILL_GPUS).
             --kv-transfer-listen-addr "0.0.0.0:$NIXL_PORT_PREFILL" \
             --inference-coordinator-port "$COORD_PORT_PREFILL" \
             --tensor-model-parallel-size "$TP_PREFILL" \
-            --pipeline-model-parallel-size 1 \
+            --pipeline-model-parallel-size "$PP_PREFILL" \
             --load "$MODEL_CHECKPOINT" \
             --tokenizer-type HuggingFaceTokenizer \
             --tokenizer-model "$TOKENIZER_MODEL" \
@@ -174,11 +179,11 @@ log "starting Megatron PREFILL coordinator (TP=$TP_PREFILL, GPUs=$PREFILL_GPUS).
 ) > "$LOG_DIR/coordinator-prefill.log" 2>&1 &
 PIDS+=($!)
 
-log "starting Megatron DECODE coordinator (TP=$TP_DECODE, GPUs=$DECODE_GPUS)..."
+log "starting Megatron DECODE coordinator (TP=$TP_DECODE PP=$PP_DECODE, GPUs=$DECODE_GPUS)..."
 (
     cd /opt/megatron-lm
     CUDA_VISIBLE_DEVICES="$DECODE_GPUS" exec python -m torch.distributed.run \
-        --nnodes=1 --nproc-per-node="$TP_DECODE" --node-rank=0 \
+        --nnodes=1 --nproc-per-node="$DECODE_NPROC" --node-rank=0 \
         --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT_DECODE" \
         tools/run_dynamic_text_generation_server.py \
             --frontend dynamo \
@@ -186,7 +191,7 @@ log "starting Megatron DECODE coordinator (TP=$TP_DECODE, GPUs=$DECODE_GPUS)..."
             --kv-transfer-listen-addr "0.0.0.0:$NIXL_PORT_DECODE" \
             --inference-coordinator-port "$COORD_PORT_DECODE" \
             --tensor-model-parallel-size "$TP_DECODE" \
-            --pipeline-model-parallel-size 1 \
+            --pipeline-model-parallel-size "$PP_DECODE" \
             --inference-dynamic-batching-prefix-caching \
             --load "$MODEL_CHECKPOINT" \
             --tokenizer-type HuggingFaceTokenizer \
