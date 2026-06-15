@@ -93,6 +93,18 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
     --mount=type=bind,source=./container/deps/requirements.megatron.txt,target=/tmp/requirements.megatron.txt \
     uv pip install --no-deps --requirement /tmp/requirements.megatron.txt
 
+# Megatron's `ssm` extra — required by hybrid/SSM models (e.g. Nemotron-H /
+# nanov3), whose Mamba layers import mamba_ssm + causal_conv1d. No aarch64
+# wheels exist on PyPI, so these compile from source. --no-build-isolation
+# builds against the base image's torch/CUDA (matches Megatron's own uv
+# `no-build-isolation-package` config; the NGC PyTorch base ships nvcc). The
+# FORCE_BUILD vars stop the packages short-circuiting to a (nonexistent)
+# prebuilt wheel. Adds a slow CUDA compile to the build, but it layer-caches.
+RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    uv pip install ninja && \
+    MAMBA_FORCE_BUILD=TRUE CAUSAL_CONV1D_FORCE_BUILD=TRUE \
+    uv pip install --no-build-isolation "causal-conv1d~=1.5" "mamba-ssm~=2.2"
+
 # Dynamo user (group 0 for OpenShift), reset upstream /workspace baggage.
 # /opt/dynamo was already created above to host the venv. Must come BEFORE
 # the NIXL COPYs below — those use --chown=dynamo:0 and would fail with
