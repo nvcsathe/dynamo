@@ -31,7 +31,7 @@ source /tmp/phase3_hetero.env
 TEMPERATURE="${TEMPERATURE:-0}"
 
 PROMPT='Explain in two sentences why the sky is blue.'
-echo "== prefill TP=$TP_PREFILL  decode TP=$TP_DECODE  temperature=$TEMPERATURE =="
+echo "== prefill TP=$TP_PREFILL PP=${PP_PREFILL:-1}  decode TP=$TP_DECODE PP=${PP_DECODE:-1}  temperature=$TEMPERATURE =="
 
 # 1. Completion. Long-enough prompt to span >1 KV block.
 RESP=$(curl -sf "$PHASE3_FRONTEND_URL/v1/chat/completions" \

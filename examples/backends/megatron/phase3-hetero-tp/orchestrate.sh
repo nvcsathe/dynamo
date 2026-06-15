@@ -1,20 +1,24 @@
 #!/usr/bin/env bash
-# Heterogeneous-TP disagg orchestrator. Identical to phase3/orchestrate.sh
-# EXCEPT it allows TP_PREFILL != TP_DECODE. The KV handoff re-shards KV heads
-# across the TP boundary (see megatron/core/inference/kv_transfer.py
-# reshard_plan + _pull_resharded).
+# Heterogeneous-TP/PP disagg orchestrator. Identical to phase3/orchestrate.sh
+# EXCEPT it allows TP_PREFILL != TP_DECODE and PP_PREFILL != PP_DECODE. The KV
+# handoff re-shards KV heads across the TP boundary (see
+# megatron/core/inference/kv_transfer.py reshard_plan + _pull_resharded).
 #
 #     NATS + etcd
-#     ├── Megatron coordinator [PREFILL]  (torchrun TP=$TP_PREFILL, GPUs 0..P-1)
-#     ├── Megatron coordinator [DECODE]   (torchrun TP=$TP_DECODE,  GPUs P..P+D-1)
+#     ├── Megatron coordinator [PREFILL]  (torchrun TP=$TP_PREFILL PP=$PP_PREFILL, GPUs 0..P-1)
+#     ├── Megatron coordinator [DECODE]   (torchrun TP=$TP_DECODE  PP=$PP_DECODE,  GPUs P..P+D-1)
 #     ├── dynamo.megatron worker [PREFILL] --role prefill
 #     ├── dynamo.megatron worker [DECODE]  --role decode
 #     └── dynamo.frontend
 #
+# Each coordinator claims TP*PP GPUs; prefill takes the first
+# TP_PREFILL*PP_PREFILL devices and decode the next TP_DECODE*PP_DECODE.
+#
 # Constraint: one of {TP_PREFILL, TP_DECODE} must divide the other, and both
 # must divide num_query_groups (KV heads). For Llama-3.1-8B num_query_groups=8,
 # so valid TP pairs are drawn from {1,2,4,8}. Past TP=8 KV heads replicate and
-# re-shard is unsupported (use matched TP there).
+# re-shard is unsupported (use matched TP there). PP just changes how the 32
+# layers are split per coordinator; it must divide num-layers (32).
 #
 # Outputs: /tmp/phase3_hetero.env + the usual per-component logs in $LOG_DIR.
 # Emits "PHASE3_HETERO_READY" on stdout once healthy.
@@ -37,6 +41,9 @@ NUM_QUERY_GROUPS="${NUM_QUERY_GROUPS:-8}"
 # Heterogeneous disagg topology — the whole point of this script.
 TP_PREFILL="${TP_PREFILL:-2}"
 TP_DECODE="${TP_DECODE:-4}"
+PP_PREFILL="${PP_PREFILL:-1}"
+PP_DECODE="${PP_DECODE:-1}"
+NUM_LAYERS="${NUM_LAYERS:-32}"
 
 # Validate compatibility up-front so we fail fast with a clear message rather
 # than deep inside reshard_plan at the first request.
@@ -48,6 +55,14 @@ if (( NUM_QUERY_GROUPS % TP_PREFILL != 0 || NUM_QUERY_GROUPS % TP_DECODE != 0 ))
     echo "FATAL: both TP sizes must divide num_query_groups($NUM_QUERY_GROUPS); past that KV heads replicate (unsupported)" >&2
     exit 1
 fi
+if (( NUM_LAYERS % PP_PREFILL != 0 || NUM_LAYERS % PP_DECODE != 0 )); then
+    echo "FATAL: both PP sizes must divide num-layers($NUM_LAYERS)" >&2
+    exit 1
+fi
+
+# World size per coordinator = TP*PP; each rank gets its own GPU.
+WORLD_PREFILL=$((TP_PREFILL * PP_PREFILL))
+WORLD_DECODE=$((TP_DECODE * PP_DECODE))
 
 HTTP_PORT="${HTTP_PORT:-8100}"
 COORD_PORT_PREFILL="${COORD_PORT_PREFILL:-5555}"
@@ -86,7 +101,7 @@ wait_for() {
     log "ready: $desc (${elapsed}s)"
 }
 
-log "Heterogeneous TP: prefill TP=$TP_PREFILL, decode TP=$TP_DECODE (num_query_groups=$NUM_QUERY_GROUPS)"
+log "Heterogeneous topology: prefill TP=$TP_PREFILL PP=$PP_PREFILL ($WORLD_PREFILL GPUs), decode TP=$TP_DECODE PP=$PP_DECODE ($WORLD_DECODE GPUs); num_query_groups=$NUM_QUERY_GROUPS num_layers=$NUM_LAYERS"
 
 ###############################################################################
 # 1. NATS + etcd
@@ -125,7 +140,7 @@ MODEL_ARGS=(
     --use-rope-scaling
     --use-rotary-position-embeddings
     --swiglu
-    --num-layers 32
+    --num-layers "$NUM_LAYERS"
     --hidden-size 4096
     --ffn-hidden-size 14336
     --num-attention-heads 32
@@ -135,21 +150,21 @@ MODEL_ARGS=(
     --bf16
 )
 
-PREFILL_GPUS=$(seq -s, 0 $((TP_PREFILL-1)))
-DECODE_GPUS=$(seq -s, $TP_PREFILL $((TP_PREFILL+TP_DECODE-1)))
+PREFILL_GPUS=$(seq -s, 0 $((WORLD_PREFILL-1)))
+DECODE_GPUS=$(seq -s, $WORLD_PREFILL $((WORLD_PREFILL+WORLD_DECODE-1)))
 
-log "starting Megatron PREFILL coordinator (TP=$TP_PREFILL, GPUs=$PREFILL_GPUS)..."
+log "starting Megatron PREFILL coordinator (TP=$TP_PREFILL PP=$PP_PREFILL, GPUs=$PREFILL_GPUS)..."
 (
     cd /opt/megatron-lm
     CUDA_VISIBLE_DEVICES="$PREFILL_GPUS" exec python -m torch.distributed.run \
-        --nnodes=1 --nproc-per-node="$TP_PREFILL" --node-rank=0 \
+        --nnodes=1 --nproc-per-node="$WORLD_PREFILL" --node-rank=0 \
         --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT_PREFILL" \
         tools/run_dynamic_text_generation_server.py \
             --frontend dynamo --disagg-role prefill \
             --kv-transfer-listen-addr "0.0.0.0:$NIXL_PORT_PREFILL" \
             --inference-coordinator-port "$COORD_PORT_PREFILL" \
             --tensor-model-parallel-size "$TP_PREFILL" \
-            --pipeline-model-parallel-size 1 \
+            --pipeline-model-parallel-size "$PP_PREFILL" \
             --load "$MODEL_CHECKPOINT" \
             --tokenizer-type HuggingFaceTokenizer \
             --tokenizer-model "$TOKENIZER_MODEL" \
@@ -157,18 +172,18 @@ log "starting Megatron PREFILL coordinator (TP=$TP_PREFILL, GPUs=$PREFILL_GPUS).
 ) > "$LOG_DIR/coordinator-prefill.log" 2>&1 &
 PIDS+=($!)
 
-log "starting Megatron DECODE coordinator (TP=$TP_DECODE, GPUs=$DECODE_GPUS)..."
+log "starting Megatron DECODE coordinator (TP=$TP_DECODE PP=$PP_DECODE, GPUs=$DECODE_GPUS)..."
 (
     cd /opt/megatron-lm
     CUDA_VISIBLE_DEVICES="$DECODE_GPUS" exec python -m torch.distributed.run \
-        --nnodes=1 --nproc-per-node="$TP_DECODE" --node-rank=0 \
+        --nnodes=1 --nproc-per-node="$WORLD_DECODE" --node-rank=0 \
         --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT_DECODE" \
         tools/run_dynamic_text_generation_server.py \
             --frontend dynamo --disagg-role decode \
             --kv-transfer-listen-addr "0.0.0.0:$NIXL_PORT_DECODE" \
             --inference-coordinator-port "$COORD_PORT_DECODE" \
             --tensor-model-parallel-size "$TP_DECODE" \
-            --pipeline-model-parallel-size 1 \
+            --pipeline-model-parallel-size "$PP_DECODE" \
             --inference-dynamic-batching-prefix-caching \
             --load "$MODEL_CHECKPOINT" \
             --tokenizer-type HuggingFaceTokenizer \
@@ -230,6 +245,8 @@ export PHASE3_PREFILL_LOG="$LOG_DIR/coordinator-prefill.log"
 export PHASE3_DECODE_LOG="$LOG_DIR/coordinator-decode.log"
 export TP_PREFILL="$TP_PREFILL"
 export TP_DECODE="$TP_DECODE"
+export PP_PREFILL="$PP_PREFILL"
+export PP_DECODE="$PP_DECODE"
 ENV
 
 log "all components healthy. test endpoint: http://127.0.0.1:$HTTP_PORT"
