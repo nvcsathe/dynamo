@@ -95,15 +95,24 @@ RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
 
 # Megatron's `ssm` extra — required by hybrid/SSM models (e.g. Nemotron-H /
 # nanov3), whose Mamba layers import mamba_ssm + causal_conv1d. No aarch64
-# wheels exist on PyPI, so these compile from source. --no-build-isolation
-# builds against the base image's torch/CUDA (matches Megatron's own uv
-# `no-build-isolation-package` config; the NGC PyTorch base ships nvcc). The
-# FORCE_BUILD vars stop the packages short-circuiting to a (nonexistent)
-# prebuilt wheel. Adds a slow CUDA compile to the build, but it layer-caches.
+# wheels exist on PyPI, so these compile from source.
+#
+# --no-deps is CRITICAL: mamba-ssm/causal-conv1d's runtime deps (torch, triton,
+# einops, transformers) are already pinned in the NGC PyTorch base. Letting uv
+# resolve them pulls a PyPI torch + nvidia-cublas-cu13 wheel into the venv,
+# which shadows the base's cuBLAS and breaks the NGC-built transformer_engine
+# (undefined symbol: cublasLtGroupedMatrixLayoutInit_internal). Same --no-deps
+# discipline as every other install in this image.
+#
+# --no-build-isolation builds against the base image's torch/CUDA (matches
+# Megatron's own uv `no-build-isolation-package` config; the NGC PyTorch base
+# ships nvcc). The FORCE_BUILD vars stop the packages short-circuiting to a
+# (nonexistent) prebuilt wheel. ninja is the only build tool not already
+# present. Adds a slow CUDA compile to the build, but it layer-caches.
 RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
-    uv pip install ninja && \
+    uv pip install --no-deps ninja && \
     MAMBA_FORCE_BUILD=TRUE CAUSAL_CONV1D_FORCE_BUILD=TRUE \
-    uv pip install --no-build-isolation "causal-conv1d~=1.5" "mamba-ssm~=2.2"
+    uv pip install --no-deps --no-build-isolation "causal-conv1d~=1.5" "mamba-ssm~=2.2"
 
 # Dynamo user (group 0 for OpenShift), reset upstream /workspace baggage.
 # /opt/dynamo was already created above to host the venv. Must come BEFORE
