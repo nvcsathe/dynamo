@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase-3 orchestrator. Brings up the minimum disaggregated stack on ONE node:
+# Orchestrates the disaggregated stack on one node:
 #
 #     NATS + etcd
 #     │
@@ -19,28 +19,13 @@
 #   - /tmp/phase3.env       : env-vars sourced by test scripts
 #   - /tmp/{nats,etcd,coordinator-prefill,coordinator-decode,worker-prefill,
 #           worker-decode,frontend}.log
-#   - On stdout: a single "PHASE3_READY" line once the frontend serves the
-#     model AND both Megatron engines are connected.
+#   - On stdout: "PHASE3_READY" once the stack is healthy.
 #
-# Phase-3 requires the decode engine to be launched with prefix caching ON —
-# the prefill-skip path uses the prefix-cache match logic to identify imported
-# blocks as cached.
+# Decode requires prefix caching for imported KV blocks.
 
 set -uo pipefail
 
-# The NGC base image bakes UCX_TLS=tcp. Override it here — inside the
-# container, after image ENV is applied — so every child process (torchrun,
-# python -m dynamo.megatron) inherits the correct value. Using srun --export
-# does not reliably win against the image-layer value on this pyxis version.
-#
-# TCP cannot handle VRAM addresses: uct_tcp_ep_am_bcopy on the prefill side
-# tries a CPU memcpy from GPU memory when serving decode's NIXL GET → SIGSEGV.
-# cuda_ipc is the zero-copy NVLink path; cuda_copy is the safe fallback.
-# tcp is included for UCX's connection manager (endpoint wireup handshake).
-# cuda_ipc / cuda_copy are included so UCX has CUDA-capable memory domains:
-# when NIXL registers VRAM via ucp_mem_map, UCX binds it to the CUDA MD and
-# selects cuda_ipc/cuda_copy for transfers — preventing the fallback to TCP
-# which crashes (uct_tcp_ep_am_bcopy CPU-memcpy from VRAM → SIGSEGV).
+# Override image UCX defaults so NIXL can register and transfer VRAM safely.
 export UCX_TLS="${UCX_TLS_OVERRIDE:-cuda_ipc,cuda_copy,tcp,shm,cma,self}"
 export UCX_MEMTYPE_CACHE="${UCX_MEMTYPE_CACHE_OVERRIDE:-n}"
 export UCX_LOG_LEVEL="${UCX_LOG_LEVEL_OVERRIDE:-info}"
@@ -123,7 +108,7 @@ wait_for "etcd /health"   30 curl -sf http://127.0.0.1:2379/health  || die "etcd
 ###############################################################################
 # 2. Two Megatron coordinators (prefill + decode)
 ###############################################################################
-# Model-architecture flags — same as Phase 0. Override for non-Llama-3.1-8B.
+# Model-architecture flags. Override for non-Llama-3.1-8B.
 MODEL_ARGS=(
     --ckpt-format torch_dist
     --use-checkpoint-args

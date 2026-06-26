@@ -1,26 +1,21 @@
 #!/usr/bin/env bash
-# Phase-3 smoke test. Runs against an already-up stack (orchestrate.sh).
-# Reads /tmp/phase3.env, hits /v1/models + /v1/chat/completions, and greps
-# the prefill + decode engine logs for the disagg markers — that's the
-# load-bearing assertion that the import + prefill-skip path actually ran.
-#
-# Exits 0 on pass, non-zero on fail.
+# Smoke test for an already-up disaggregated stack.
 
 set -euo pipefail
 
-[[ -f /tmp/phase3.env ]] || { echo "FAIL: /tmp/phase3.env not found — is the stack up?" >&2; exit 2; }
+[[ -f /tmp/phase3.env ]] || { echo "FAIL: /tmp/phase3.env not found; is the stack up?" >&2; exit 2; }
 source /tmp/phase3.env
 
 echo "[smoke] frontend: $PHASE3_FRONTEND_URL"
 echo "[smoke] model:    $PHASE3_MODEL_NAME"
 
-# 1. /v1/models lists the served model.
+# /v1/models lists the served model.
 MODELS=$(curl -sf "$PHASE3_FRONTEND_URL/v1/models")
 echo "$MODELS" | grep -q "$PHASE3_MODEL_NAME" \
     || { echo "FAIL: $PHASE3_MODEL_NAME not in /v1/models: $MODELS" >&2; exit 1; }
 echo "[smoke] /v1/models OK"
 
-# 2. Drive a long-enough prompt to fill multiple KV blocks.
+# Drive a prompt long enough to fill multiple KV blocks.
 LONG_PROMPT=$(printf 'Hello %.0s' {1..200})
 RESPONSE=$(curl -sN "$PHASE3_FRONTEND_URL/v1/chat/completions" \
     -H 'content-type: application/json' \
@@ -42,17 +37,17 @@ if [[ -z $FINISH_LINE ]]; then
 fi
 echo "[smoke] streamed $DELTA_COUNT deltas, finish: $FINISH_LINE"
 
-# 3. Prefill engine pinned blocks for a handoff request.
+# Prefill pinned blocks for a handoff request.
 sleep 2  # give the engines a beat to flush logs
 PREFILL_MARKER=$(grep -m1 'DISAGG_PREFILL_HANDOFF' "$PHASE3_PREFILL_LOG" || true)
 if [[ -z $PREFILL_MARKER ]]; then
     echo "FAIL: no DISAGG_PREFILL_HANDOFF in $PHASE3_PREFILL_LOG" >&2
-    echo "         (prefill engine never pinned KV blocks — handoff path not taken)" >&2
+    echo "         (prefill engine never pinned KV blocks; handoff path not taken)" >&2
     exit 1
 fi
 echo "[smoke] prefill engine: $PREFILL_MARKER"
 
-# 4. Decode engine imported KV and registered hashes for prefill-skip.
+# Decode imported KV and registered hashes for prefill-skip.
 DECODE_MARKER=$(grep -m1 'DISAGG_DECODE_IMPORT' "$PHASE3_DECODE_LOG" || true)
 if [[ -z $DECODE_MARKER ]]; then
     echo "FAIL: no DISAGG_DECODE_IMPORT in $PHASE3_DECODE_LOG" >&2
@@ -61,13 +56,12 @@ if [[ -z $DECODE_MARKER ]]; then
 fi
 echo "[smoke] decode engine:  $DECODE_MARKER"
 
-# Pull `hashes_registered=N` and assert N > 0 — that's what makes the prefix
-# match path actually skip prefill (vs. just transferring data nobody uses).
+# hashes_registered > 0 means prefix matching can skip prefill.
 HASHES_REG=$(echo "$DECODE_MARKER" | grep -oP 'hashes_registered=\K\d+')
 if [[ -z $HASHES_REG || $HASHES_REG -lt 1 ]]; then
-    echo "FAIL: decode imported blocks but registered 0 hashes — prefill not skipped" >&2
+    echo "FAIL: decode imported blocks but registered 0 hashes; prefill not skipped" >&2
     echo "         $DECODE_MARKER" >&2
     exit 1
 fi
 
-echo "[smoke] PASS — end-to-end disagg verified (hashes_registered=$HASHES_REG)"
+echo "[smoke] PASS: end-to-end disagg verified (hashes_registered=$HASHES_REG)"

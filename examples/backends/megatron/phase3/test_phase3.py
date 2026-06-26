@@ -1,20 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Phase-3 (disaggregated) functional test.
+"""Disaggregated Megatron functional test.
 
-Runs against an already-up Dynamo+Megatron Phase-3 stack started by
-``orchestrate.sh``. Reads ``/tmp/phase3.env`` (or environment variables of
-the same name) to locate the frontend + engine logs, then exercises:
+Runs against an already-up Dynamo+Megatron disaggregated stack. Reads
+``/tmp/phase3.env`` or matching environment variables.
 
-1. ``/v1/models`` advertises the served model.
-2. A streaming chat completion produces deltas and finishes — proves
-   end-to-end disagg works (if NIXL transfer or KV import were broken the
-   decode side would generate garbage or crash, not stream coherent tokens).
-3. The Megatron PREFILL engine log contains ``DISAGG_PREFILL_HANDOFF`` —
-   proves the prefill side pinned blocks and emitted disaggregated_params.
-4. The Megatron DECODE engine log contains ``DISAGG_DECODE_IMPORT`` —
-   proves the decode side took the NIXL-import + prefill-skip path
-   (not the regular ``add_request`` Phase-0 fallback).
+Checks the model endpoint, streaming completion, prefill handoff marker, and
+decode-side KV import marker.
 
 Run inside the container:
 
@@ -35,6 +27,7 @@ import json
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pytest
@@ -73,7 +66,7 @@ def stack() -> dict[str, str]:
     missing = [k for k in REQUIRED_VARS if k not in env]
     if missing:
         pytest.skip(
-            "Phase-3 stack not detected. Start it with orchestrate.sh, or set "
+            "Disaggregated stack not detected. Start it with orchestrate.sh, or set "
             f"{', '.join(REQUIRED_VARS)} in the environment. Missing: {missing}"
         )
     return env
@@ -117,7 +110,7 @@ def _send_completion(stack, prompt: str, max_tokens: int = 32) -> list[dict]:
 
 
 def test_streaming_completion_through_disagg_pipeline(stack):
-    """A long-enough prompt to span multiple KV blocks → exercises the import."""
+    """Use a prompt long enough to span multiple KV blocks."""
     long_prompt = " ".join(["Hello"] * 200)  # ~200 tokens; enough to cross 64-token blocks
     chunks = _send_completion(stack, prompt=f"{long_prompt} Summarize.", max_tokens=32)
     assert chunks, "no SSE chunks received"
@@ -136,6 +129,9 @@ def test_streaming_completion_through_disagg_pipeline(stack):
 _PREFILL_MARKER = re.compile(r"DISAGG_PREFILL_HANDOFF\s+request_id=(\d+)\s+pinned_blocks=(\d+)")
 _DECODE_MARKER = re.compile(
     r"DISAGG_DECODE_IMPORT\s+request_id=(\d+)\s+prompt_tokens=(\d+)\s+imported_blocks=(\d+)\s+hashes_registered=(\d+)"
+)
+_DECODE_SUBMIT_MARKER = re.compile(
+    r"DISAGG_DECODE_PULL_SUBMIT\s+request_id=(\d+)\s+prompt_tokens=(\d+)\s+blocks=(\d+)\s+pending_imports=(\d+)"
 )
 
 
@@ -157,15 +153,14 @@ def _read_log_with_retry(path: str, max_seconds: int = 20) -> str:
 def test_prefill_engine_pinned_blocks_for_handoff(stack):
     """One full request must have driven the prefill engine to pin KV blocks."""
     # Drive a request first so the log has something to assert on.
-    _send_completion(stack, prompt="Phase-3 prefill marker probe.", max_tokens=8)
+    _send_completion(stack, prompt="Prefill marker probe.", max_tokens=8)
     log = _read_log_with_retry(stack["PHASE3_PREFILL_LOG"])
     matches = _PREFILL_MARKER.findall(log)
     assert matches, (
-        "no DISAGG_PREFILL_HANDOFF markers in prefill engine log — prefill "
+        "no DISAGG_PREFILL_HANDOFF markers in prefill engine log; prefill "
         "side did not pin KV blocks for a request. Check that "
         "sampling_params.do_kv_handoff was set by the prefill worker handler."
     )
-    # Sanity: at least one pinned-block count is positive.
     assert any(int(blk) > 0 for _, blk in matches), (
         f"prefill saw the disagg path but pinned 0 blocks: {matches}"
     )
@@ -174,24 +169,60 @@ def test_prefill_engine_pinned_blocks_for_handoff(stack):
 def test_decode_engine_imported_kv_and_skipped_prefill(stack):
     """The decode engine must have taken the NIXL-import + prefix-cache match path.
 
-    This is the load-bearing Phase-3 assertion: tokens coming back from the
-    frontend (test above) only prove the response works; this proves the
-    decode side actually went through ``add_request_with_kv_handoff``
-    (NIXL pull + prefix-cache match → short decode-side prefill) rather than the
-    Phase-0 ``add_request`` (full prompt re-prefill).
+    This proves the decode side used ``add_request_with_kv_handoff`` rather than
+    regular full-prompt admission.
     """
-    _send_completion(stack, prompt="Phase-3 decode marker probe.", max_tokens=8)
+    _send_completion(stack, prompt="Decode marker probe.", max_tokens=8)
     log = _read_log_with_retry(stack["PHASE3_DECODE_LOG"])
     matches = _DECODE_MARKER.findall(log)
     assert matches, (
-        "no DISAGG_DECODE_IMPORT markers in decode engine log — decode side "
+        "no DISAGG_DECODE_IMPORT markers in decode engine log; decode side "
         "did not take the kv-handoff import path. Either the frontend routed "
         "the request as aggregated (PrefillRouter not active?), or the "
         "decode worker's --role flag isn't `decode`."
     )
-    # Stronger assertion: hashes_registered > 0 confirms the prefix-cache
-    # match path actually has matchable blocks to skip prefill on.
     assert any(int(reg) > 0 for _, _, _, reg in matches), (
-        f"decode imported blocks but registered 0 hashes — prefix-cache "
+        f"decode imported blocks but registered 0 hashes; prefix-cache "
         f"match path can't skip prefill in this case: {matches}"
+    )
+
+
+def test_async_nixl_pull_stress(stack):
+    """Burst handoffs so decode can queue multiple async NIXL pulls."""
+    if os.environ.get("PHASE3_ASYNC_PULL_STRESS") != "1":
+        pytest.skip("set PHASE3_ASYNC_PULL_STRESS=1 to run the async pull stress test")
+
+    bursts = [2, 4, 3]
+    prompts = []
+    for burst_idx, count in enumerate(bursts):
+        for req_idx in range(count):
+            repeated = " ".join([f"burst{burst_idx}-req{req_idx}"] * 220)
+            prompts.append(f"{repeated} Return one short sentence.")
+
+    with ThreadPoolExecutor(max_workers=max(bursts)) as pool:
+        futures = []
+        start = 0
+        for burst_idx, count in enumerate(bursts):
+            for prompt in prompts[start : start + count]:
+                futures.append(pool.submit(_send_completion, stack, prompt, 8))
+            start += count
+            if burst_idx < len(bursts) - 1:
+                time.sleep([1, 3][burst_idx])
+
+        for fut in as_completed(futures, timeout=600):
+            chunks = fut.result()
+            assert chunks, "stress request returned no stream chunks"
+
+    log = _read_log_with_retry(stack["PHASE3_DECODE_LOG"], max_seconds=30)
+    submits = _DECODE_SUBMIT_MARKER.findall(log)
+    ready = _DECODE_MARKER.findall(log)
+    assert len(submits) >= len(prompts), (
+        f"expected at least {len(prompts)} async import submissions, got {len(submits)}"
+    )
+    assert len(ready) >= len(prompts), (
+        f"expected at least {len(prompts)} completed imports, got {len(ready)}"
+    )
+    assert max(int(pending) for *_, pending in submits) >= 2, (
+        "async pull stress did not observe overlapping pending imports; "
+        f"submit markers: {submits[-len(prompts):]}"
     )

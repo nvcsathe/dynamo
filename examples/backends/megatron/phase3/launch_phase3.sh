@@ -1,14 +1,11 @@
 #!/usr/bin/env bash
-# Phase-3 host wrapper. Run from inside an existing salloc'd shell on the
-# login node. srun's into the dynamo-megatron container (enroot/pyxis) and
-# invokes orchestrate.sh, which brings up the two-engine (prefill + decode)
-# disagg topology.
+# Host wrapper for the disaggregated Megatron stack.
 #
 # Required env:
 #   SLURM_JOB_ID   set automatically by salloc
 #   DMG_SQSH       absolute path to the dynamo-megatron container sqsh.
 #                  The container must have `nixl` Python + native runtime
-#                  importable — confirm with:
+#                  importable; confirm with:
 #                      python -c "from nixl._api import nixl_agent"
 #                  inside the container before relying on this launcher.
 #   STAGE          lustre staging dir holding the model checkpoint + hf-cache
@@ -21,13 +18,14 @@
 #   NIXL_PORT_PREFILL, NIXL_PORT_DECODE            (default 7000, 7001)
 #   MASTER_PORT_PREFILL, MASTER_PORT_DECODE        (default 29500, 29501)
 #   MEGATRON_LOCAL_DEV
+#   PHASE3_ASYNC_PULL_STRESS=1                     run bursty async-pull pytest then exit
 #
 # UCX transport / logging (force-set in this script, use _OVERRIDE suffix to change):
 #   UCX_TLS_OVERRIDE            transport allow-list (default: cuda_ipc,cuda_copy,cma,shm,self)
-#                               TCP is intentionally excluded — it cannot handle VRAM addresses.
+#                               TCP cannot handle VRAM addresses.
 #                               The NGC base image bakes in UCX_TLS=tcp; this script overrides it.
 #   UCX_MEMTYPE_CACHE_OVERRIDE  set to "n" by default to avoid early-init misclassification
-#   UCX_LOG_LEVEL_OVERRIDE      UCX log verbosity (default: info — set to warn once stable)
+#   UCX_LOG_LEVEL_OVERRIDE      UCX log verbosity
 #   UCX_LOG_FILE_OVERRIDE       log path; UCX expands %p to PID (default: /tmp/ucx_%p.log)
 #
 # If MEGATRON_LOCAL_DEV is set, the host directory it points to is mounted
@@ -44,10 +42,7 @@ set -euo pipefail
 [[ -d "$STAGE"   ]] || { echo "STAGE not found: $STAGE"        >&2; exit 1; }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Default to the dynamo checkout this launcher belongs to. Override with
-# DYNAMO_LOCAL_DEV=/some/other/path if you want to mount a different
-# checkout (e.g. one that has Phase-3 dynamo code while this launcher
-# was vendored from somewhere older).
+# Default to this Dynamo checkout. Override with DYNAMO_LOCAL_DEV if needed.
 DYNAMO_ROOT="${DYNAMO_LOCAL_DEV:-$(cd "$SCRIPT_DIR/../../../.." && pwd)}"
 [[ -d "$DYNAMO_ROOT" ]] || { echo "DYNAMO_ROOT not a dir: $DYNAMO_ROOT" >&2; exit 1; }
 echo "[launch] dynamo source mount: $DYNAMO_ROOT -> /workspace"
@@ -59,28 +54,15 @@ if [[ -n "${MEGATRON_LOCAL_DEV:-}" ]]; then
     echo "[launch] live Megatron mount: $MEGATRON_LOCAL_DEV -> /opt/megatron-lm"
 fi
 
-# Forward env that orchestrate.sh consumes. HF_TOKEN is needed for gated
-# repos like meta-llama/Llama-3.1-8B.
+# Forward env consumed by orchestrate.sh.
 EXPORT_VARS="STAGE,HF_HOME,HF_TOKEN,MODEL_CHECKPOINT,MODEL_DIR,TOKENIZER_MODEL,SERVED_MODEL_NAME"
 EXPORT_VARS="$EXPORT_VARS,CONTEXT_LENGTH,TP_PREFILL,TP_DECODE,PP_PREFILL,PP_DECODE,HTTP_PORT"
 EXPORT_VARS="$EXPORT_VARS,COORD_PORT_PREFILL,COORD_PORT_DECODE"
 EXPORT_VARS="$EXPORT_VARS,NIXL_PORT_PREFILL,NIXL_PORT_DECODE"
 EXPORT_VARS="$EXPORT_VARS,MASTER_PORT_PREFILL,MASTER_PORT_DECODE"
+EXPORT_VARS="$EXPORT_VARS,PHASE3_ASYNC_PULL_STRESS"
 
-# UCX transport constraints and diagnostic logging.
-#
-# The NGC base image bakes in UCX_TLS=tcp to keep NCCL off UCX-RDMA paths.
-# That setting is fatal for NIXL: uct_tcp_ep_am_bcopy on the prefill side
-# tries to CPU-memcpy from VRAM addresses when handling decode's GET request
-# → SIGSEGV on aarch64. We must force-override it unconditionally (no :=
-# setdefault — that silently skips if the var is already set to "tcp").
-#
-# Passing the override both as an exported shell var and via srun --env
-# ensures pyxis applies it on top of the image ENV layer.
-#
-# UCX_LOG_LEVEL=info + UCX_LOG_FILE captures which transport UCX selects.
-# Grep the log after a run: grep -iE 'tls|cuda|tcp|selected' /tmp/ucx_*.log
-# Set UCX_LOG_LEVEL=warn once cuda_icp is confirmed as the chosen transport.
+# Force CUDA-capable UCX transports for NIXL VRAM transfers.
 UCX_TLS="${UCX_TLS_OVERRIDE:-cuda_ipc,cuda_copy,tcp,shm,cma,self}"
 UCX_MEMTYPE_CACHE="${UCX_MEMTYPE_CACHE_OVERRIDE:-n}"
 UCX_LOG_LEVEL="${UCX_LOG_LEVEL_OVERRIDE:-info}"
@@ -91,7 +73,53 @@ echo "[launch] container: $DMG_SQSH"
 echo "[launch] mounts:    $MOUNTS"
 echo "[launch] UCX_TLS=$UCX_TLS  UCX_LOG_FILE=$UCX_LOG_FILE"
 echo "[launch] expect 'PHASE3_READY' on stdout when ready"
+if [[ "${PHASE3_ASYNC_PULL_STRESS:-0}" == "1" ]]; then
+    echo "[launch] async NIXL pull stress test enabled"
+fi
 echo
+
+if [[ "${PHASE3_ASYNC_PULL_STRESS:-0}" == "1" ]]; then
+    PHASE3_ENTRYPOINT='
+set -euo pipefail
+bash /workspace/examples/backends/megatron/phase3/orchestrate.sh &
+orch_pid=$!
+cleanup() {
+    kill "$orch_pid" 2>/dev/null || true
+    wait "$orch_pid" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+ready=0
+for _ in $(seq 1 600); do
+    if [[ -f /tmp/phase3.env ]]; then
+        # shellcheck disable=SC1091
+        source /tmp/phase3.env
+        if curl -sf "$PHASE3_FRONTEND_URL/v1/models" >/dev/null; then
+            ready=1
+            break
+        fi
+    fi
+    if ! kill -0 "$orch_pid" 2>/dev/null; then
+        echo "[launch] orchestrate.sh exited before readiness" >&2
+        wait "$orch_pid"
+    fi
+    sleep 1
+done
+
+if [[ "$ready" != "1" ]]; then
+    echo "[launch] timed out waiting for stack readiness" >&2
+    exit 1
+fi
+
+# shellcheck disable=SC1091
+source /tmp/phase3.env
+PHASE3_ASYNC_PULL_STRESS=1 python -m pytest -q \
+    /workspace/examples/backends/megatron/phase3/test_phase3.py \
+    -k async_nixl_pull_stress -s
+'
+else
+    PHASE3_ENTRYPOINT='exec bash /workspace/examples/backends/megatron/phase3/orchestrate.sh'
+fi
 
 exec srun \
     --jobid="$SLURM_JOB_ID" --overlap \
@@ -100,4 +128,4 @@ exec srun \
     --container-mounts="$MOUNTS" \
     --container-workdir=/workspace \
     --export="ALL,$EXPORT_VARS,UCX_TLS=$UCX_TLS,UCX_MEMTYPE_CACHE=$UCX_MEMTYPE_CACHE,UCX_LOG_LEVEL=$UCX_LOG_LEVEL,UCX_LOG_FILE=$UCX_LOG_FILE" \
-    bash /workspace/examples/backends/megatron/phase3/orchestrate.sh
+    bash -lc "$PHASE3_ENTRYPOINT"

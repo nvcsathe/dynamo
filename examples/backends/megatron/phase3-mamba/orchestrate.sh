@@ -7,13 +7,13 @@
 # (see kv_transfer.py + dynamic_engine._import_mamba_handoff).
 #
 #     NATS + etcd
-#     ├── Megatron coordinator [PREFILL]   (TP=1 PP=1, GPU 0)  --disagg-role prefill
-#     ├── Megatron coordinator [DECODE]    (TP=1 PP=1, GPU 1)  --disagg-role decode
+#     ├── Megatron coordinator [PREFILL]   (TP=1 PP=1 EP=2, GPUs 0,1)  --disagg-role prefill
+#     ├── Megatron coordinator [DECODE]    (TP=1 PP=1 EP=2, GPUs 2,3)  --disagg-role decode
 #     ├── dynamo.megatron worker [PREFILL] --role prefill
 #     ├── dynamo.megatron worker [DECODE]  --role decode
 #     ├── dynamo.frontend                  (disagg stack, :$HTTP_PORT)
-#     └── [optional baseline, WITH_BASELINE=1]
-#         ├── Megatron coordinator [AGG]   (TP=1 PP=1, GPU 2)  --disagg-role aggregated
+#     └── [optional baseline, WITH_BASELINE=1, needs its own spare GPUs]
+#         ├── Megatron coordinator [AGG]   (TP=1 PP=1, GPUs $GPU_BASELINE)  --disagg-role aggregated
 #         ├── dynamo.megatron worker [AGG] --role aggregated
 #         └── dynamo.frontend              (baseline stack, :$HTTP_PORT_AGG)
 #
@@ -23,7 +23,9 @@
 # attention-only checks pass even when conv/ssm state is zeroed.
 #
 # Mamba transfer is matched TP=1/PP=1 only (enforced in setup_kv_transfer); the
-# conv/ssm state has no TP/PP reshard plan yet.
+# conv/ssm state has no TP/PP reshard plan yet. EP>1 is allowed and is how this
+# 30B-A3B MoE is sharded to fit (experts split across GPUs, replicated Mamba
+# state pulled rank-to-rank — each rank runs its own NIXL agent).
 #
 # Outputs: /tmp/phase3_mamba.env + per-component logs in $LOG_DIR.
 # Emits "PHASE3_MAMBA_READY" on stdout once healthy.
@@ -47,6 +49,10 @@ PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-/lustre/fsw/portfolios/llmservic
 TOKENIZER_MODEL="${TOKENIZER_MODEL:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/nemotron6/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-nemotron3-nano}"
 CONTEXT_LENGTH="${CONTEXT_LENGTH:-4096}"
+# Engine's max inference sequence length. Sizes the per-request KV/activation
+# workspace, so keep it at the context length we actually serve — the original
+# 73728 sized the engine for a 72K context and wasted GPU memory on a 4K serve.
+INFER_MAX_SEQ_LEN="${INFER_MAX_SEQ_LEN:-$CONTEXT_LENGTH}"
 # Dynamic-batching KV buffer budget (per engine). Nano v3 test uses 70.
 INFER_BUFFER_GB="${INFER_BUFFER_GB:-70}"
 
@@ -58,12 +64,21 @@ PREFIX_CACHE="${PREFIX_CACHE:-1}"
 MAMBA_GB="${MAMBA_GB:-4.0}"
 
 # Bring up the non-disagg reference stack for the gold-standard token diff.
-WITH_BASELINE="${WITH_BASELINE:-1}"
+# Defaults OFF: on a 4-GPU node the disagg roles below already claim all four
+# GPUs (EP=2 prefill + EP=2 decode), leaving none for the baseline. Set
+# WITH_BASELINE=1 only when you have spare GPUs (e.g. assign GPU_BASELINE="4,5").
+WITH_BASELINE="${WITH_BASELINE:-0}"
 
-# GPUs: prefill=0, decode=1, baseline=2.
-GPU_PREFILL="${GPU_PREFILL:-0}"
-GPU_DECODE="${GPU_DECODE:-1}"
-GPU_BASELINE="${GPU_BASELINE:-2}"
+# GPUs per role, as a comma-separated list. The number of GPUs in each list is
+# the role's expert-model-parallel size (EP) — Nemotron-3 Nano is a 30B-A3B MoE
+# whose ~56 GiB of bf16 weights do NOT fit on one GPU alongside the inference
+# buffer, so the experts are sharded across GPUs. EP shards experts only; TP/PP
+# stay 1, which is exactly what the Mamba conv/ssm handoff requires (the handoff
+# is gated on TP=1/PP=1, not EP — see setup_kv_transfer). Default 4-GPU layout:
+# prefill on 0,1 and decode on 2,3.
+GPU_PREFILL="${GPU_PREFILL:-0,1}"
+GPU_DECODE="${GPU_DECODE:-2,3}"
+GPU_BASELINE="${GPU_BASELINE:-0,1}"
 
 HTTP_PORT="${HTTP_PORT:-8100}"
 HTTP_PORT_AGG="${HTTP_PORT_AGG:-8101}"
@@ -105,7 +120,7 @@ wait_for() {
     log "ready: $desc (${elapsed}s)"
 }
 
-log "Hybrid disagg (Mamba transfer): prefill GPU=$GPU_PREFILL, decode GPU=$GPU_DECODE; baseline=$WITH_BASELINE (GPU=$GPU_BASELINE)"
+log "Hybrid disagg (Mamba transfer): prefill GPUs=$GPU_PREFILL, decode GPUs=$GPU_DECODE; baseline=$WITH_BASELINE (GPUs=$GPU_BASELINE)"
 
 ###############################################################################
 # Model args — Nemotron-3 Nano (hybrid Mamba-2 + attention + MoE).
@@ -114,10 +129,12 @@ log "Hybrid disagg (Mamba transfer): prefill GPU=$GPU_PREFILL, decode GPU=$GPU_D
 # helper already supplies (--load, --tokenizer-model, --tensor/pipeline-model-
 # parallel-size). Architecture comes from the checkpoint (--use-checkpoint-args).
 #
-# EP is pinned to 1: this Mamba-transfer test runs one rank per role (matched
-# TP=1/PP=1, single GPU each). The functional test uses EP=${WORLD_SIZE} to
-# shard experts across GPUs, but multi-rank-per-role isn't wired for the Mamba
-# handoff yet, so keep a single process per coordinator here.
+# EP is NOT pinned here: it is derived per role from the GPU-list length and
+# passed by launch_coordinator (--expert-model-parallel-size). The Mamba handoff
+# is gated only on TP=1/PP=1 (setup_kv_transfer raises otherwise); EP shards
+# experts while leaving the replicated attention/Mamba state — and therefore the
+# conv/ssm handoff layout — identical on every rank. So EP>1 is the supported
+# way to fit this 30B-A3B MoE across multiple GPUs.
 #
 # Override the whole block with MODEL_ARGS_OVERRIDE="--foo ... --bar ...".
 ###############################################################################
@@ -130,7 +147,6 @@ else
         --pretrained-checkpoint "$PRETRAINED_CHECKPOINT"
         --use-checkpoint-args
         --dist-ckpt-strictness log_unexpected
-        --expert-model-parallel-size 1
         --expert-tensor-parallel-size 1
         --moe-router-score-function sigmoid
         --moe-router-enable-expert-bias
@@ -141,7 +157,7 @@ else
         --moe-shared-expert-overlap
         --seq-length 73728
         --max-position-embeddings 73728
-        --inference-max-seq-length 73728
+        --inference-max-seq-length "$INFER_MAX_SEQ_LEN"
         --transformer-impl inference_optimized
         --inference-grouped-gemm-backend vllm
         --inference-use-synchronous-zmq-collectives
@@ -158,21 +174,24 @@ if [[ "$PREFIX_CACHE" == "1" ]]; then
     )
 fi
 
-# Launch one Megatron coordinator. Args: role gpu master_port coord_port log
-# [extra args...]
+# Launch one Megatron coordinator. Args: role gpus master_port coord_port log
+# [extra args...]. `gpus` is a comma-separated list; its length is the role's
+# nproc-per-node and expert-model-parallel size (TP/PP stay 1 for the handoff).
 launch_coordinator() {
-    local role="$1" gpu="$2" master_port="$3" coord_port="$4" logf="$5"; shift 5
-    log "starting Megatron $role coordinator (GPU=$gpu)..."
+    local role="$1" gpus="$2" master_port="$3" coord_port="$4" logf="$5"; shift 5
+    local _g; IFS=',' read -ra _g <<< "$gpus"; local nproc="${#_g[@]}" ep="${#_g[@]}"
+    log "starting Megatron $role coordinator (GPUs=$gpus, EP=$ep)..."
     (
         cd /opt/megatron-lm
-        CUDA_VISIBLE_DEVICES="$gpu" exec python -m torch.distributed.run \
-            --nnodes=1 --nproc-per-node=1 --node-rank=0 \
+        CUDA_VISIBLE_DEVICES="$gpus" exec python -m torch.distributed.run \
+            --nnodes=1 --nproc-per-node="$nproc" --node-rank=0 \
             --master-addr="$MASTER_ADDR" --master-port="$master_port" \
             tools/run_dynamic_text_generation_server.py \
                 --frontend dynamo --disagg-role "$role" \
                 --inference-coordinator-port "$coord_port" \
                 --tensor-model-parallel-size 1 \
                 --pipeline-model-parallel-size 1 \
+                --expert-model-parallel-size "$ep" \
                 --load "$MODEL_CHECKPOINT" \
                 --tokenizer-model "$TOKENIZER_MODEL" \
                 "${MODEL_ARGS[@]}" "$@"
