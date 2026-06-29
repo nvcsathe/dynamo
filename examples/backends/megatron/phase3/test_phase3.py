@@ -27,7 +27,6 @@ import json
 import os
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import pytest
@@ -130,11 +129,6 @@ _PREFILL_MARKER = re.compile(r"DISAGG_PREFILL_HANDOFF\s+request_id=(\d+)\s+pinne
 _DECODE_MARKER = re.compile(
     r"DISAGG_DECODE_IMPORT\s+request_id=(\d+)\s+prompt_tokens=(\d+)\s+imported_blocks=(\d+)\s+hashes_registered=(\d+)"
 )
-_DECODE_SUBMIT_MARKER = re.compile(
-    r"DISAGG_DECODE_PULL_SUBMIT\s+request_id=(\d+)\s+prompt_tokens=(\d+)\s+blocks=(\d+)\s+pending_imports=(\d+)"
-)
-
-
 def _read_log_with_retry(path: str, max_seconds: int = 20) -> str:
     """Engines flush logs asynchronously. Re-read for up to `max_seconds`."""
     deadline = time.time() + max_seconds
@@ -184,45 +178,4 @@ def test_decode_engine_imported_kv_and_skipped_prefill(stack):
     assert any(int(reg) > 0 for _, _, _, reg in matches), (
         f"decode imported blocks but registered 0 hashes; prefix-cache "
         f"match path can't skip prefill in this case: {matches}"
-    )
-
-
-def test_async_nixl_pull_stress(stack):
-    """Burst handoffs so decode can queue multiple async NIXL pulls."""
-    if os.environ.get("PHASE3_ASYNC_PULL_STRESS") != "1":
-        pytest.skip("set PHASE3_ASYNC_PULL_STRESS=1 to run the async pull stress test")
-
-    bursts = [2, 4, 3]
-    prompts = []
-    for burst_idx, count in enumerate(bursts):
-        for req_idx in range(count):
-            repeated = " ".join([f"burst{burst_idx}-req{req_idx}"] * 220)
-            prompts.append(f"{repeated} Return one short sentence.")
-
-    with ThreadPoolExecutor(max_workers=max(bursts)) as pool:
-        futures = []
-        start = 0
-        for burst_idx, count in enumerate(bursts):
-            for prompt in prompts[start : start + count]:
-                futures.append(pool.submit(_send_completion, stack, prompt, 8))
-            start += count
-            if burst_idx < len(bursts) - 1:
-                time.sleep([1, 3][burst_idx])
-
-        for fut in as_completed(futures, timeout=600):
-            chunks = fut.result()
-            assert chunks, "stress request returned no stream chunks"
-
-    log = _read_log_with_retry(stack["PHASE3_DECODE_LOG"], max_seconds=30)
-    submits = _DECODE_SUBMIT_MARKER.findall(log)
-    ready = _DECODE_MARKER.findall(log)
-    assert len(submits) >= len(prompts), (
-        f"expected at least {len(prompts)} async import submissions, got {len(submits)}"
-    )
-    assert len(ready) >= len(prompts), (
-        f"expected at least {len(prompts)} completed imports, got {len(ready)}"
-    )
-    assert max(int(pending) for *_, pending in submits) >= 2, (
-        "async pull stress did not observe overlapping pending imports; "
-        f"submit markers: {submits[-len(prompts):]}"
     )

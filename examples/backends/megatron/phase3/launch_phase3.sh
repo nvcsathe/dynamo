@@ -18,7 +18,10 @@
 #   NIXL_PORT_PREFILL, NIXL_PORT_DECODE            (default 7000, 7001)
 #   MASTER_PORT_PREFILL, MASTER_PORT_DECODE        (default 29500, 29501)
 #   MEGATRON_LOCAL_DEV
-#   PHASE3_ASYNC_PULL_STRESS=1                     run bursty async-pull pytest then exit
+#   PHASE3_ASYNC_PULL_BENCHMARK=1                  run async-pull benchmark then exit
+#   PHASE3_BENCH_BURSTS                            comma-separated burst sizes, default 2,4,3
+#   PHASE3_BENCH_BURST_GAPS                        comma-separated seconds between bursts
+#   PHASE3_BENCH_PROMPT_WORDS, PHASE3_BENCH_MAX_TOKENS, PHASE3_BENCH_WARMUP
 #
 # UCX transport / logging (force-set in this script, use _OVERRIDE suffix to change):
 #   UCX_TLS_OVERRIDE            transport allow-list (default: cuda_ipc,cuda_copy,cma,shm,self)
@@ -60,7 +63,10 @@ EXPORT_VARS="$EXPORT_VARS,CONTEXT_LENGTH,TP_PREFILL,TP_DECODE,PP_PREFILL,PP_DECO
 EXPORT_VARS="$EXPORT_VARS,COORD_PORT_PREFILL,COORD_PORT_DECODE"
 EXPORT_VARS="$EXPORT_VARS,NIXL_PORT_PREFILL,NIXL_PORT_DECODE"
 EXPORT_VARS="$EXPORT_VARS,MASTER_PORT_PREFILL,MASTER_PORT_DECODE"
-EXPORT_VARS="$EXPORT_VARS,PHASE3_ASYNC_PULL_STRESS"
+EXPORT_VARS="$EXPORT_VARS,PHASE3_ASYNC_PULL_BENCHMARK,PHASE3_ASYNC_PULL_STRESS"
+EXPORT_VARS="$EXPORT_VARS,PHASE3_BENCH_BURSTS,PHASE3_BENCH_BURST_GAPS"
+EXPORT_VARS="$EXPORT_VARS,PHASE3_BENCH_PROMPT_WORDS,PHASE3_BENCH_MAX_TOKENS"
+EXPORT_VARS="$EXPORT_VARS,PHASE3_BENCH_WARMUP,PHASE3_BENCH_TIMEOUT,PHASE3_BENCH_OUTPUT"
 
 # Force CUDA-capable UCX transports for NIXL VRAM transfers.
 UCX_TLS="${UCX_TLS_OVERRIDE:-cuda_ipc,cuda_copy,tcp,shm,cma,self}"
@@ -73,12 +79,13 @@ echo "[launch] container: $DMG_SQSH"
 echo "[launch] mounts:    $MOUNTS"
 echo "[launch] UCX_TLS=$UCX_TLS  UCX_LOG_FILE=$UCX_LOG_FILE"
 echo "[launch] expect 'PHASE3_READY' on stdout when ready"
-if [[ "${PHASE3_ASYNC_PULL_STRESS:-0}" == "1" ]]; then
-    echo "[launch] async NIXL pull stress test enabled"
+RUN_ASYNC_PULL_BENCHMARK="${PHASE3_ASYNC_PULL_BENCHMARK:-${PHASE3_ASYNC_PULL_STRESS:-0}}"
+if [[ "$RUN_ASYNC_PULL_BENCHMARK" == "1" ]]; then
+    echo "[launch] async NIXL pull benchmark enabled"
 fi
 echo
 
-if [[ "${PHASE3_ASYNC_PULL_STRESS:-0}" == "1" ]]; then
+if [[ "$RUN_ASYNC_PULL_BENCHMARK" == "1" ]]; then
     PHASE3_ENTRYPOINT='
 set -euo pipefail
 bash /workspace/examples/backends/megatron/phase3/orchestrate.sh &
@@ -113,9 +120,7 @@ fi
 
 # shellcheck disable=SC1091
 source /tmp/phase3.env
-PHASE3_ASYNC_PULL_STRESS=1 python -m pytest -q \
-    /workspace/examples/backends/megatron/phase3/test_phase3.py \
-    -k async_nixl_pull_stress -s
+python /workspace/examples/backends/megatron/phase3/benchmark_async_pull.py
 '
 else
     PHASE3_ENTRYPOINT='exec bash /workspace/examples/backends/megatron/phase3/orchestrate.sh'
