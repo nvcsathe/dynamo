@@ -88,6 +88,7 @@ echo
 if [[ "$RUN_ASYNC_PULL_BENCHMARK" == "1" ]]; then
     PHASE3_ENTRYPOINT='
 set -euo pipefail
+rm -f /tmp/phase3.env
 bash /workspace/examples/backends/megatron/phase3/orchestrate.sh &
 orch_pid=$!
 cleanup() {
@@ -101,7 +102,7 @@ for _ in $(seq 1 600); do
     if [[ -f /tmp/phase3.env ]]; then
         # shellcheck disable=SC1091
         source /tmp/phase3.env
-        if curl -sf "$PHASE3_FRONTEND_URL/v1/models" >/dev/null; then
+        if curl -sf "$PHASE3_FRONTEND_URL/v1/models" | grep -q "$PHASE3_MODEL_NAME"; then
             ready=1
             break
         fi
@@ -120,7 +121,13 @@ fi
 
 # shellcheck disable=SC1091
 source /tmp/phase3.env
-python /workspace/examples/backends/megatron/phase3/benchmark_async_pull.py
+bench_status=0
+python /workspace/examples/backends/megatron/phase3/benchmark_async_pull.py || bench_status=$?
+if ! kill -0 "$orch_pid" 2>/dev/null; then
+    echo "[launch] orchestrate.sh exited during benchmark" >&2
+    wait "$orch_pid" || true
+fi
+exit "$bench_status"
 '
 else
     PHASE3_ENTRYPOINT='exec bash /workspace/examples/backends/megatron/phase3/orchestrate.sh'

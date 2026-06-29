@@ -99,31 +99,58 @@ def _stream_request(
     chunks = 0
     output_chars = 0
     finish_reason = None
-    with requests.post(
-        f"{url}/v1/chat/completions",
-        json=payload,
-        stream=True,
-        timeout=timeout,
-    ) as response:
-        response.raise_for_status()
-        for raw in response.iter_lines(decode_unicode=True):
-            if not raw or not raw.startswith("data:"):
-                continue
-            payload_text = raw[len("data:") :].strip()
-            if payload_text == "[DONE]":
-                break
-            if first_chunk is None:
-                first_chunk = time.perf_counter()
-            chunks += 1
-            chunk = json.loads(payload_text)
-            choice = chunk.get("choices", [{}])[0]
-            finish_reason = choice.get("finish_reason") or finish_reason
-            output_chars += len(choice.get("delta", {}).get("content") or "")
+    error = None
+    status_code = None
+    pending_payload = ""
+    try:
+        with requests.post(
+            f"{url}/v1/chat/completions",
+            json=payload,
+            stream=True,
+            timeout=timeout,
+        ) as response:
+            status_code = response.status_code
+            if response.status_code >= 400:
+                body = response.text[:1000]
+                error = f"HTTP {response.status_code}: {body}"
+            else:
+                for raw in response.iter_lines(decode_unicode=True):
+                    if not raw:
+                        continue
+                    if not raw.startswith("data:"):
+                        if pending_payload:
+                            pending_payload += raw.strip()
+                        continue
+                    if pending_payload:
+                        pending_payload += raw[len("data:") :].strip()
+                    else:
+                        pending_payload = raw[len("data:") :].strip()
+                    if pending_payload == "[DONE]":
+                        pending_payload = ""
+                        break
+                    try:
+                        chunk = json.loads(pending_payload)
+                    except json.JSONDecodeError:
+                        continue
+                    pending_payload = ""
+                    if first_chunk is None:
+                        first_chunk = time.perf_counter()
+                    chunks += 1
+                    choice = chunk.get("choices", [{}])[0]
+                    finish_reason = choice.get("finish_reason") or finish_reason
+                    output_chars += len(choice.get("delta", {}).get("content") or "")
+                if pending_payload:
+                    error = f"truncated SSE JSON: {pending_payload[:500]}"
+                if chunks == 0:
+                    error = error or "stream completed without chunks"
+    except Exception as exc:  # noqa: BLE001 - report benchmark failures in summary
+        error = repr(exc)
     finished = time.perf_counter()
-    if chunks == 0:
-        raise RuntimeError(f"request {index} produced no stream chunks")
     return {
         "index": index,
+        "ok": error is None,
+        "error": error,
+        "status_code": status_code,
         "ttft_s": (first_chunk - started) if first_chunk is not None else None,
         "latency_s": finished - started,
         "chunks": chunks,
@@ -148,6 +175,23 @@ def _read_decode_markers(path: str) -> dict[str, Any]:
         "imported_blocks": sum(int(row[2]) for row in imports),
         "registered_hashes": sum(int(row[3]) for row in imports),
     }
+
+
+def _check_model_ready(url: str, model: str) -> None:
+    response = requests.get(f"{url}/v1/models", timeout=30)
+    response.raise_for_status()
+    body = response.json()
+    model_ids = {item.get("id") for item in body.get("data", [])}
+    if model not in model_ids:
+        raise RuntimeError(f"model {model!r} not listed by /v1/models: {sorted(model_ids)}")
+
+
+def _tail(path: str, lines: int = 80) -> list[str]:
+    try:
+        content = Path(path).read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    return content[-lines:]
 
 
 def main() -> int:
@@ -178,6 +222,17 @@ def main() -> int:
         type=int,
         default=int(os.environ.get("PHASE3_BENCH_WARMUP", "1")),
     )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=int(os.environ.get("PHASE3_BENCH_MAX_WORKERS", "0")),
+        help="Thread pool size. Default is the largest burst.",
+    )
+    parser.add_argument(
+        "--allow-failures",
+        action="store_true",
+        default=os.environ.get("PHASE3_BENCH_ALLOW_FAILURES", "0") == "1",
+    )
     parser.add_argument("--output", default=os.environ.get("PHASE3_BENCH_OUTPUT", ""))
     args = parser.parse_args()
 
@@ -191,10 +246,11 @@ def main() -> int:
     model = env["PHASE3_MODEL_NAME"]
     decode_log = env["PHASE3_DECODE_LOG"]
 
-    requests.get(f"{url}/v1/models", timeout=30).raise_for_status()
+    _check_model_ready(url, model)
 
+    warmup_failures = []
     for warmup_idx in range(args.warmup):
-        _stream_request(
+        warmup_result = _stream_request(
             url=url,
             model=model,
             prompt=_build_prompt(-(warmup_idx + 1), args.prompt_words),
@@ -202,11 +258,18 @@ def main() -> int:
             timeout=args.timeout,
             index=-(warmup_idx + 1),
         )
+        if not warmup_result["ok"]:
+            warmup_failures.append(warmup_result)
+    if warmup_failures:
+        print("[bench] warmup failed")
+        print(json.dumps(warmup_failures, indent=2, sort_keys=True))
+        return 10
 
     total_requests = sum(bursts)
     started = time.perf_counter()
     results: list[dict[str, Any]] = []
-    with ThreadPoolExecutor(max_workers=max(bursts)) as pool:
+    max_workers = args.max_workers or max(bursts)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = []
         request_index = 0
         for burst_idx, count in enumerate(bursts):
@@ -228,26 +291,51 @@ def main() -> int:
                 time.sleep(gaps[burst_idx])
 
         for future in as_completed(futures, timeout=args.timeout * max(1, total_requests)):
-            result = future.result()
+            try:
+                result = future.result()
+            except Exception as exc:  # noqa: BLE001 - keep benchmark alive
+                result = {
+                    "index": -1,
+                    "ok": False,
+                    "error": repr(exc),
+                    "status_code": None,
+                    "ttft_s": None,
+                    "latency_s": 0.0,
+                    "chunks": 0,
+                    "output_chars": 0,
+                    "finish_reason": None,
+                }
             results.append(result)
-            print(
-                "[bench] request {index} done latency={latency_s:.3f}s ttft={ttft_s:.3f}s chunks={chunks}".format(
-                    **result
+            if result["ok"]:
+                print(
+                    "[bench] request {index} done latency={latency_s:.3f}s ttft={ttft_s:.3f}s chunks={chunks}".format(
+                        **result
+                    )
                 )
-            )
+            else:
+                print(
+                    f"[bench] request {result['index']} failed "
+                    f"latency={result['latency_s']:.3f}s error={result['error']}"
+                )
 
     elapsed = time.perf_counter() - started
-    latencies = [float(row["latency_s"]) for row in results]
-    ttfts = [float(row["ttft_s"]) for row in results if row["ttft_s"] is not None]
+    successes = [row for row in results if row["ok"]]
+    failures = [row for row in results if not row["ok"]]
+    latencies = [float(row["latency_s"]) for row in successes]
+    ttfts = [float(row["ttft_s"]) for row in successes if row["ttft_s"] is not None]
     markers = _read_decode_markers(decode_log)
+    log_dir = str(Path(decode_log).parent)
     summary = {
         "requests": len(results),
+        "succeeded": len(successes),
+        "failed": len(failures),
         "bursts": bursts,
         "burst_gaps_s": gaps[: max(0, len(bursts) - 1)],
+        "max_workers": max_workers,
         "prompt_words": args.prompt_words,
         "max_tokens": args.max_tokens,
         "elapsed_s": elapsed,
-        "request_rate": len(results) / elapsed if elapsed > 0 else 0.0,
+        "request_rate": len(successes) / elapsed if elapsed > 0 else 0.0,
         "latency_s": {
             "avg": statistics.mean(latencies) if latencies else 0.0,
             "p50": _percentile(latencies, 50),
@@ -263,6 +351,7 @@ def main() -> int:
             "max": max(ttfts) if ttfts else 0.0,
         },
         "decode_log": markers,
+        "failures": failures[:20],
     }
 
     print("[bench] summary")
@@ -270,13 +359,28 @@ def main() -> int:
     if args.output:
         Path(args.output).write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
 
-    if markers["pull_submit_count"] < total_requests:
+    if failures and not args.allow_failures:
+        print("[bench] ERROR: one or more requests failed", file=sys.stderr)
+        for name in (
+            "frontend.log",
+            "worker-prefill.log",
+            "worker-decode.log",
+            "coordinator-prefill.log",
+            "coordinator-decode.log",
+        ):
+            path = str(Path(log_dir) / name)
+            tail = _tail(path, lines=60)
+            if tail:
+                print(f"\n[bench] tail {path}", file=sys.stderr)
+                print("\n".join(tail), file=sys.stderr)
+        return 20
+    if markers["pull_submit_count"] < len(successes):
         print("[bench] ERROR: fewer pull submissions than benchmark requests", file=sys.stderr)
         return 2
-    if markers["import_count"] < total_requests:
+    if markers["import_count"] < len(successes):
         print("[bench] ERROR: fewer completed imports than benchmark requests", file=sys.stderr)
         return 3
-    if markers["max_pending_imports"] < 2 and total_requests > 1:
+    if markers["max_pending_imports"] < 2 and len(successes) > 1:
         print("[bench] ERROR: async imports did not overlap", file=sys.stderr)
         return 4
     return 0
