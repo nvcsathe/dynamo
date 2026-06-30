@@ -57,12 +57,15 @@ async def worker() -> None:
         needs = [[WorkerType.Decode]]
     elif config.role == "decode":
         handler = DecodeWorkerHandler(config, engine_client)
-        model_type = ModelType.Chat
+        # The handler consumes token IDs and supports raw prompts as well as
+        # chat requests. Correctness tests use raw completions so the frontend
+        # does not transform the prompt with a chat template.
+        model_type = ModelType.Chat | ModelType.Completions
         worker_type = WorkerType.Decode
         needs = [[WorkerType.Prefill]]
     else:
         handler = DecodeWorkerHandler(config, engine_client)
-        model_type = ModelType.Chat
+        model_type = ModelType.Chat | ModelType.Completions
         worker_type = WorkerType.Aggregated
         needs = []
 

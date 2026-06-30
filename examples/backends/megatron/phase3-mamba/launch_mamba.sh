@@ -13,13 +13,15 @@
 #
 # Checkpoint / tokenizer (default to the cluster-staged Nano v3 artifacts). The
 # wrapper binds each of these into the container at the SAME absolute path so
-# orchestrate.sh's --load / --tokenizer-model resolve unchanged:
+# orchestrate.sh's --load / --pretrained-checkpoint resolve unchanged:
 #   MODEL_CHECKPOINT       (default /lustre/.../ksanthanam/nemotron-3-nano-30b)
 #   PRETRAINED_CHECKPOINT  (default /lustre/.../ksanthanam/nanov3)
-#   TOKENIZER_MODEL        (default /lustre/.../nemotron6/tokenizers/...vocab.json)
+#   TOKENIZER_MODEL        (optional explicit tokenizer override)
+#   DYNAMO_MODEL           (default nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16)
 #
 # Optional env (forwarded to orchestrate.sh):
-#   SERVED_MODEL_NAME, CONTEXT_LENGTH, INFER_BUFFER_GB, MAMBA_GB, PREFIX_CACHE
+#   SERVED_MODEL_NAME, PREFLIGHT_ONLY, CONTEXT_LENGTH, INFER_BUFFER_GB, INFER_MAX_TOKENS
+#   INFER_MAX_REQUESTS, MAMBA_GB, PREFIX_CACHE, ROLE_EP_SIZE
 #   WITH_BASELINE, GPU_PREFILL, GPU_DECODE, GPU_BASELINE, MODEL_ARGS_OVERRIDE
 #   HTTP_PORT, HTTP_PORT_AGG, COORD_PORT_*, NIXL_PORT_*, MASTER_PORT_*
 #   EXTRA_MOUNTS  extra comma-separated src:dst binds (e.g. your own ckpt dir)
@@ -40,8 +42,9 @@ set -euo pipefail
 # Defaults must match orchestrate.sh so the mounts cover what it will --load.
 MODEL_CHECKPOINT="${MODEL_CHECKPOINT:-/lustre/fsw/portfolios/llmservice/users/ksanthanam/nemotron-3-nano-30b}"
 PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-/lustre/fsw/portfolios/llmservice/users/ksanthanam/nanov3}"
-TOKENIZER_MODEL="${TOKENIZER_MODEL:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/nemotron6/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json}"
-export MODEL_CHECKPOINT PRETRAINED_CHECKPOINT TOKENIZER_MODEL
+TOKENIZER_MODEL="${TOKENIZER_MODEL:-}"
+DYNAMO_MODEL="${DYNAMO_MODEL:-nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16}"
+export MODEL_CHECKPOINT PRETRAINED_CHECKPOINT TOKENIZER_MODEL DYNAMO_MODEL
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DYNAMO_ROOT="${DYNAMO_LOCAL_DEV:-$(cd "$SCRIPT_DIR/../../../.." && pwd)}"
@@ -69,7 +72,12 @@ add_mount() {
 
 add_mount "$MODEL_CHECKPOINT"
 add_mount "$PRETRAINED_CHECKPOINT"
-add_mount "$TOKENIZER_MODEL"
+if [[ -n "$TOKENIZER_MODEL" ]]; then
+    add_mount "$TOKENIZER_MODEL"
+fi
+if [[ -e "$DYNAMO_MODEL" ]]; then
+    add_mount "$DYNAMO_MODEL"
+fi
 
 if [[ -n "${EXTRA_MOUNTS:-}" ]]; then
     MOUNTS="$MOUNTS,$EXTRA_MOUNTS"
@@ -90,8 +98,9 @@ if [[ -n "${DYNAMO_MEGATRON_LOCAL_DEV:-}" ]]; then
 fi
 
 # Forward env that orchestrate.sh consumes.
-EXPORT_VARS="STAGE,HF_HOME,HF_TOKEN,MODEL_CHECKPOINT,PRETRAINED_CHECKPOINT,TOKENIZER_MODEL"
-EXPORT_VARS="$EXPORT_VARS,SERVED_MODEL_NAME,CONTEXT_LENGTH,INFER_MAX_SEQ_LEN,INFER_BUFFER_GB,MAMBA_GB,PREFIX_CACHE"
+EXPORT_VARS="STAGE,HF_HOME,HF_TOKEN,MODEL_CHECKPOINT,PRETRAINED_CHECKPOINT,TOKENIZER_MODEL,DYNAMO_MODEL"
+EXPORT_VARS="$EXPORT_VARS,SERVED_MODEL_NAME,PREFLIGHT_ONLY,CONTEXT_LENGTH,INFER_MAX_SEQ_LEN,INFER_BUFFER_GB,INFER_MAX_TOKENS,INFER_MAX_REQUESTS"
+EXPORT_VARS="$EXPORT_VARS,MAMBA_GB,PREFIX_CACHE,ROLE_EP_SIZE"
 EXPORT_VARS="$EXPORT_VARS,WITH_BASELINE,GPU_PREFILL,GPU_DECODE,GPU_BASELINE,MODEL_ARGS_OVERRIDE"
 EXPORT_VARS="$EXPORT_VARS,HTTP_PORT,HTTP_PORT_AGG,COORD_PORT_PREFILL,COORD_PORT_DECODE,COORD_PORT_AGG"
 EXPORT_VARS="$EXPORT_VARS,NIXL_PORT_PREFILL,NIXL_PORT_DECODE"

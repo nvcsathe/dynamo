@@ -51,9 +51,20 @@ bash launch_mamba.sh           # prints PHASE3_MAMBA_READY
 Or, if you're already inside the container with the checkpoint mounted:
 
 ```bash
-# node with >=3 GPUs (prefill, decode, baseline)
+# node with >=4 GPUs (prefill EP=2, decode EP=2)
 bash orchestrate.sh            # prints PHASE3_MAMBA_READY
 ```
+
+Run the tokenizer/model-card preflight before spending time loading the model:
+
+```bash
+PREFLIGHT_ONLY=1 bash orchestrate.sh
+# PHASE3_MAMBA_PREFLIGHT_OK
+```
+
+The preflight resolves only the HF configuration/tokenizer files; it does not
+download the HF weights. The actual weights still come exclusively from
+`MODEL_CHECKPOINT`.
 
 Then, in a second shell inside the same container:
 
@@ -68,32 +79,47 @@ The Nano artifacts live under `/lustre/fsw/portfolios/llmservice/...`, a
 different portfolio than `$STAGE`, so a single `$STAGE` bind doesn't reach them.
 `launch_mamba.sh` binds each artifact's directory into the container at the
 **same absolute path** (read-only) via pyxis `--container-mounts`, so
-orchestrate.sh's `--load` / `--pretrained-checkpoint` / `--tokenizer-model`
-resolve unchanged. It dedupes shared parent dirs (ckpt + pretrained under the
-same `users/` dir mount once). Point at your own copy by exporting
-`MODEL_CHECKPOINT` / `PRETRAINED_CHECKPOINT` / `TOKENIZER_MODEL`, or add extra
-binds with `EXTRA_MOUNTS="src:dst,src2:dst2"`.
+orchestrate.sh's `--load` / `--pretrained-checkpoint` resolve unchanged. It
+dedupes shared parent dirs (ckpt + pretrained under the same `users/` dir mount
+once). Point at your own copy by exporting `MODEL_CHECKPOINT` /
+`PRETRAINED_CHECKPOINT` / `DYNAMO_MODEL`, or add extra binds with
+`EXTRA_MOUNTS="src:dst,src2:dst2"`.
 
-`orchestrate.sh` defaults `MODEL_CHECKPOINT`, `PRETRAINED_CHECKPOINT` and
-`TOKENIZER_MODEL` to the cluster-staged Nemotron-3 Nano v3 artifacts (the same
-ones the Nano v3 functional test uses), and its `MODEL_ARGS` mirror that test
-(`--model-provider mamba`, MoE + `transformer-impl inference_optimized`, etc.).
-Override any of them to point at your own copy. The checkpoint is consumed only
-by `orchestrate.sh` (via `--load`); `verify_mamba.sh` just hits the running HTTP
-endpoint and needs nothing checkpoint-related.
+`orchestrate.sh` defaults `MODEL_CHECKPOINT` and `PRETRAINED_CHECKPOINT` to the
+cluster-staged Nemotron-3 Nano v3 artifacts (the same ones the Nano v3
+functional test uses), and its `MODEL_ARGS` mirror the known working Nano
+dynamic-serving config (`--model-provider hybrid`, EP sharding, chunked prefill,
+flash attention, CUDA graph block scope, etc.). Override any of them to point at
+your own copy. The checkpoint is consumed only by `orchestrate.sh` (via
+`--load`); `verify_mamba.sh` just hits the running HTTP endpoint and needs
+nothing checkpoint-related.
 
-It brings up the disagg stack (prefill GPU0 + decode GPU1) and, by default
-(`WITH_BASELINE=1`), a non-disagg **aggregated** reference of the same model on
-GPU2 for the gold-standard token diff. Set `WITH_BASELINE=0` to skip it (verify
-then only checks the import markers, not correctness).
+By default, the test does not pass Megatron `--tokenizer-model`; with
+`--use-checkpoint-args`, Megatron reads the tokenizer settings from the
+checkpoint args. Set `TOKENIZER_MODEL` only when you need to override that with
+an explicit vocab file. Dynamo's worker registration is separate: use
+`DYNAMO_MODEL` for the model directory / HF id with `config.json` and tokenizer
+metadata. It defaults to `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`. Do not
+point it at the Megatron `nanov3` pretrained directory unless that directory
+also contains HF-style `config.json` and `tokenizer.json`. The orchestrator
+resolves an HF id with `ignore_weights=True` once, then passes that local
+metadata directory to all Dynamo workers. This avoids downloading the 30B HF
+weights during worker registration.
 
-`verify_mamba.sh` uses `/v1/completions` (raw prompt) rather than chat
-completions because the Nano tokenizer is a plain `vocab.json` with no chat
-template.
+It brings up the disagg stack with fixed `TP=1`, `PP=1`, `EP=2` per role:
+prefill uses `GPU_PREFILL=0,1` and decode uses `GPU_DECODE=2,3` by default.
+`WITH_BASELINE=0` is the default because those four GPUs are already claimed by
+the disagg roles. Set `WITH_BASELINE=1` only when you have two spare GPUs for an
+aggregated `EP=2` reference, for example `GPU_BASELINE=4,5`.
 
-EP is pinned to 1 (one rank per role). The functional test shards experts with
-`--expert-model-parallel-size ${WORLD_SIZE}`; multi-rank-per-role isn't wired
-for the Mamba handoff yet, so keep a single process per coordinator here.
+`verify_mamba.sh` uses `/v1/completions` so both stacks receive the exact same
+raw prompt without chat-template transformations. Megatron may use its native
+checkpoint vocabulary internally, while Dynamo requires the equivalent HF
+`tokenizer.json` to expose this HTTP endpoint.
+
+EP is pinned to 2 by default (`ROLE_EP_SIZE=2`), with `TP=1` and `PP=1`. Mamba
+handoff is gated on TP/PP only; EP shards experts while leaving the transferred
+attention KV and Mamba conv/SSM state layout matched rank-to-rank.
 
 ## How verify proves correctness
 
@@ -115,12 +141,17 @@ for the Mamba handoff yet, so keep a single process per coordinator here.
 | --- | --- | --- |
 | `MODEL_CHECKPOINT` | `…/ksanthanam/nemotron-3-nano-30b` | mcore checkpoint served via `--load` |
 | `PRETRAINED_CHECKPOINT` | `…/ksanthanam/nanov3` | `--pretrained-checkpoint` source |
-| `TOKENIZER_MODEL` | `…/multiMixV8….vocab.json` | tokenizer vocab passed to `--tokenizer-model` |
-| `INFER_BUFFER_GB` | `70` | dynamic-batching KV buffer budget per engine |
+| `TOKENIZER_MODEL` | _(unset)_ | optional Megatron `--tokenizer-model` override; unset uses checkpoint args |
+| `DYNAMO_MODEL` | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` | model dir / HF id passed to Dynamo `--model` |
+| `PREFLIGHT_ONLY` | `0` | set to `1` to resolve/validate tokenizer metadata and exit before GPU startup |
+| `INFER_BUFFER_GB` | `20` | dynamic-batching KV buffer budget per engine |
+| `INFER_MAX_TOKENS` | `8192` | dynamic batching token budget |
+| `INFER_MAX_REQUESTS` | `256` | dynamic batching request cap |
 | `MAMBA_GB` | `4.0` | Mamba state-cache budget (both prefill + decode) |
 | `PREFIX_CACHE` | `1` | enable prefix caching (required for the handoff path) |
-| `WITH_BASELINE` | `1` | also launch the aggregated reference for the token diff |
-| `GPU_PREFILL`/`GPU_DECODE`/`GPU_BASELINE` | `0`/`1`/`2` | GPU assignment |
+| `ROLE_EP_SIZE` | `2` | expert-model-parallel size per role; TP/PP stay 1 |
+| `WITH_BASELINE` | `0` | also launch the aggregated reference for the token diff |
+| `GPU_PREFILL`/`GPU_DECODE`/`GPU_BASELINE` | `0,1`/`2,3`/`4,5` | GPU assignment |
 | `MODEL_ARGS_OVERRIDE` | _(unset)_ | replace the entire Nemotron arg block |
 
 ## Scope / limitations

@@ -128,6 +128,10 @@ def _stream_request(
                     if pending_payload == "[DONE]":
                         pending_payload = ""
                         break
+                    done_after_json = False
+                    if pending_payload.endswith("[DONE]"):
+                        pending_payload = pending_payload[: -len("[DONE]")].strip()
+                        done_after_json = True
                     try:
                         chunk = json.loads(pending_payload)
                     except json.JSONDecodeError:
@@ -139,6 +143,8 @@ def _stream_request(
                     choice = chunk.get("choices", [{}])[0]
                     finish_reason = choice.get("finish_reason") or finish_reason
                     output_chars += len(choice.get("delta", {}).get("content") or "")
+                    if done_after_json:
+                        break
                 if pending_payload:
                     error = f"truncated SSE JSON: {pending_payload[:500]}"
                 if chunks == 0:
