@@ -104,6 +104,8 @@ mod tests {
                 kv_total_blocks: 100,
                 gpu_cache_usage: 0.5,
                 kv_cache_hit_rate: Some(0.3),
+                active_requests: 2,
+                waiting_requests: 1,
                 dp_rank: 42,
             },
         );
@@ -125,6 +127,8 @@ mod tests {
                 kv_total_blocks: 100,
                 gpu_cache_usage: 0.07,
                 kv_cache_hit_rate: Some(0.25),
+                active_requests: 2,
+                waiting_requests: 1,
                 dp_rank: 0,
             },
         );
@@ -141,6 +145,14 @@ mod tests {
         assert!(
             text.contains("dynamo_component_gpu_cache_usage_percent"),
             "gpu_cache_usage_percent not in /metrics: {text}"
+        );
+        assert!(
+            text.contains("dynamo_component_active_requests") && text.contains("2"),
+            "active_requests not in /metrics: {text}"
+        );
+        assert!(
+            text.contains("dynamo_component_waiting_requests") && text.contains("1"),
+            "waiting_requests not in /metrics: {text}"
         );
     }
 

@@ -398,6 +398,8 @@ pub struct ComponentSnapshot {
     ///  SGLang: `kv_metrics.cache_hit_rate_perc`,
     ///  TRT-LLM: `kv_stats["cacheHitRate"]`).
     pub kv_cache_hit_rate: Option<f32>,
+    pub active_requests: u64,
+    pub waiting_requests: u64,
     pub dp_rank: u32,
 }
 

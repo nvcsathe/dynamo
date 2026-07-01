@@ -50,6 +50,8 @@ def test_source_descriptors_carry_payload_and_defaults():
     )
     assert snap.dp_rank == 0
     assert snap.kv_cache_hit_rate is None
+    assert snap.active_requests == 0
+    assert snap.waiting_requests == 0
 
 
 class _MinimalEngine(LLMEngine):

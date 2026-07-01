@@ -16,7 +16,7 @@
 # orchestrate.sh's --load / --pretrained-checkpoint resolve unchanged:
 #   MODEL_CHECKPOINT       (default /lustre/.../ksanthanam/nemotron-3-nano-30b)
 #   PRETRAINED_CHECKPOINT  (default /lustre/.../ksanthanam/nanov3)
-#   TOKENIZER_MODEL        (optional explicit tokenizer override)
+#   TOKENIZER_MODEL        (Megatron tiktoken vocab restored by the checkpoint)
 #   DYNAMO_MODEL           (default nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16)
 #
 # Optional env (forwarded to orchestrate.sh):
@@ -42,7 +42,7 @@ set -euo pipefail
 # Defaults must match orchestrate.sh so the mounts cover what it will --load.
 MODEL_CHECKPOINT="${MODEL_CHECKPOINT:-/lustre/fsw/portfolios/llmservice/users/ksanthanam/nemotron-3-nano-30b}"
 PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-/lustre/fsw/portfolios/llmservice/users/ksanthanam/nanov3}"
-TOKENIZER_MODEL="${TOKENIZER_MODEL:-}"
+TOKENIZER_MODEL="${TOKENIZER_MODEL:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/nemotron6/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json}"
 DYNAMO_MODEL="${DYNAMO_MODEL:-nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16}"
 export MODEL_CHECKPOINT PRETRAINED_CHECKPOINT TOKENIZER_MODEL DYNAMO_MODEL
 
@@ -72,9 +72,7 @@ add_mount() {
 
 add_mount "$MODEL_CHECKPOINT"
 add_mount "$PRETRAINED_CHECKPOINT"
-if [[ -n "$TOKENIZER_MODEL" ]]; then
-    add_mount "$TOKENIZER_MODEL"
-fi
+add_mount "$TOKENIZER_MODEL"
 if [[ -e "$DYNAMO_MODEL" ]]; then
     add_mount "$DYNAMO_MODEL"
 fi

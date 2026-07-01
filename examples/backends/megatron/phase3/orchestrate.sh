@@ -3,22 +3,13 @@
 #
 #     NATS + etcd
 #     │
-#     ├── Megatron coordinator [PREFILL]  (torchrun TP=$TP_PREFILL, GPUs 0..N-1)
-#     │     - --frontend dynamo --disagg-role prefill
-#     │     - --kv-transfer-listen-addr 0.0.0.0:$NIXL_PORT_PREFILL
-#     │
-#     ├── Megatron coordinator [DECODE]   (torchrun TP=$TP_DECODE, GPUs N..2N-1)
-#     │     - --frontend dynamo --disagg-role decode --enable-prefix-caching
-#     │     - --kv-transfer-listen-addr 0.0.0.0:$NIXL_PORT_DECODE
-#     │
-#     ├── dynamo.megatron worker [PREFILL]  --role prefill   --coordinator-addr <prefill coord>
-#     ├── dynamo.megatron worker [DECODE]   --role decode    --coordinator-addr <decode coord>
+#     ├── dynamo.megatron owned engine [PREFILL] (TP/PP rank group)
+#     ├── dynamo.megatron owned engine [DECODE]  (TP/PP rank group)
 #     └── dynamo.frontend
 #
 # Outputs:
 #   - /tmp/phase3.env       : env-vars sourced by test scripts
-#   - /tmp/{nats,etcd,coordinator-prefill,coordinator-decode,worker-prefill,
-#           worker-decode,frontend}.log
+#   - /tmp/{nats,etcd,worker-prefill,worker-decode,frontend}.log
 #   - On stdout: "PHASE3_READY" once the stack is healthy.
 #
 # Decode requires prefix caching for imported KV blocks.
@@ -106,7 +97,7 @@ wait_for "nats /healthz"  30 curl -sf http://127.0.0.1:8222/healthz || die "nats
 wait_for "etcd /health"   30 curl -sf http://127.0.0.1:2379/health  || die "etcd never healthy"
 
 ###############################################################################
-# 2. Two Megatron coordinators (prefill + decode)
+# 2. Two self-owned Dynamo Megatron engines (prefill + decode)
 ###############################################################################
 # Model-architecture flags. Override for non-Llama-3.1-8B.
 MODEL_ARGS=(
@@ -144,37 +135,40 @@ DECODE_NPROC=$((TP_DECODE  * PP_DECODE))
 PREFILL_GPUS=$(seq -s, 0 $((PREFILL_NPROC - 1)))
 DECODE_GPUS=$(seq -s, $PREFILL_NPROC $((PREFILL_NPROC + DECODE_NPROC - 1)))
 
-log "starting Megatron PREFILL coordinator (TP=$TP_PREFILL PP=$PP_PREFILL, GPUs=$PREFILL_GPUS)..."
+log "starting owned Megatron PREFILL engine (TP=$TP_PREFILL PP=$PP_PREFILL, GPUs=$PREFILL_GPUS)..."
 (
-    cd /opt/megatron-lm
-    CUDA_VISIBLE_DEVICES="$PREFILL_GPUS" exec python -m torch.distributed.run \
-        --nnodes=1 --nproc-per-node="$PREFILL_NPROC" --node-rank=0 \
-        --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT_PREFILL" \
-        tools/run_dynamic_text_generation_server.py \
-            --frontend dynamo \
-            --disagg-role prefill \
-            --kv-transfer-listen-addr "0.0.0.0:$NIXL_PORT_PREFILL" \
-            --inference-coordinator-port "$COORD_PORT_PREFILL" \
+    CUDA_VISIBLE_DEVICES="$PREFILL_GPUS" exec python -m dynamo.megatron \
+            --role prefill \
+            --model "$TOKENIZER_MODEL" \
+            --served-model-name "$SERVED_MODEL_NAME" \
+            --nproc-per-node "$PREFILL_NPROC" \
+            --coordinator-host 127.0.0.1 \
+            --coordinator-port "$COORD_PORT_PREFILL" \
+            --kv-transfer-listen-addr "127.0.0.1:$NIXL_PORT_PREFILL" \
+            --megatron-root /opt/megatron-lm \
+            -- \
             --tensor-model-parallel-size "$TP_PREFILL" \
             --pipeline-model-parallel-size "$PP_PREFILL" \
+            --inference-dynamic-batching-prefix-caching \
             --load "$MODEL_CHECKPOINT" \
             --tokenizer-type HuggingFaceTokenizer \
             --tokenizer-model "$TOKENIZER_MODEL" \
             "${MODEL_ARGS[@]}"
-) > "$LOG_DIR/coordinator-prefill.log" 2>&1 &
+) > "$LOG_DIR/worker-prefill.log" 2>&1 &
 PIDS+=($!)
 
-log "starting Megatron DECODE coordinator (TP=$TP_DECODE PP=$PP_DECODE, GPUs=$DECODE_GPUS)..."
+log "starting owned Megatron DECODE engine (TP=$TP_DECODE PP=$PP_DECODE, GPUs=$DECODE_GPUS)..."
 (
-    cd /opt/megatron-lm
-    CUDA_VISIBLE_DEVICES="$DECODE_GPUS" exec python -m torch.distributed.run \
-        --nnodes=1 --nproc-per-node="$DECODE_NPROC" --node-rank=0 \
-        --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT_DECODE" \
-        tools/run_dynamic_text_generation_server.py \
-            --frontend dynamo \
-            --disagg-role decode \
-            --kv-transfer-listen-addr "0.0.0.0:$NIXL_PORT_DECODE" \
-            --inference-coordinator-port "$COORD_PORT_DECODE" \
+    CUDA_VISIBLE_DEVICES="$DECODE_GPUS" exec python -m dynamo.megatron \
+            --role decode \
+            --model "$TOKENIZER_MODEL" \
+            --served-model-name "$SERVED_MODEL_NAME" \
+            --nproc-per-node "$DECODE_NPROC" \
+            --coordinator-host 127.0.0.1 \
+            --coordinator-port "$COORD_PORT_DECODE" \
+            --kv-transfer-listen-addr "127.0.0.1:$NIXL_PORT_DECODE" \
+            --megatron-root /opt/megatron-lm \
+            -- \
             --tensor-model-parallel-size "$TP_DECODE" \
             --pipeline-model-parallel-size "$PP_DECODE" \
             --inference-dynamic-batching-prefix-caching \
@@ -182,45 +176,9 @@ log "starting Megatron DECODE coordinator (TP=$TP_DECODE PP=$PP_DECODE, GPUs=$DE
             --tokenizer-type HuggingFaceTokenizer \
             --tokenizer-model "$TOKENIZER_MODEL" \
             "${MODEL_ARGS[@]}"
-) > "$LOG_DIR/coordinator-decode.log" 2>&1 &
+) > "$LOG_DIR/worker-decode.log" 2>&1 &
 PIDS+=($!)
 
-wait_for "prefill coordinator announced" 600 \
-    grep -q "MEGATRON_COORDINATOR_ADDR=" "$LOG_DIR/coordinator-prefill.log" \
-    || die "prefill coordinator never announced (see $LOG_DIR/coordinator-prefill.log)"
-wait_for "decode coordinator announced" 600 \
-    grep -q "MEGATRON_COORDINATOR_ADDR=" "$LOG_DIR/coordinator-decode.log" \
-    || die "decode coordinator never announced (see $LOG_DIR/coordinator-decode.log)"
-
-PREFILL_COORD_ADDR=$(grep -m1 -oP 'MEGATRON_COORDINATOR_ADDR=\K\S+' "$LOG_DIR/coordinator-prefill.log")
-DECODE_COORD_ADDR=$(grep -m1 -oP 'MEGATRON_COORDINATOR_ADDR=\K\S+' "$LOG_DIR/coordinator-decode.log")
-log "prefill coordinator at $PREFILL_COORD_ADDR"
-log "decode coordinator at $DECODE_COORD_ADDR"
-
-###############################################################################
-# 3. Two Dynamo Megatron workers
-###############################################################################
-log "starting Dynamo PREFILL worker..."
-python -m dynamo.megatron \
-    --role prefill \
-    --coordinator-addr "$PREFILL_COORD_ADDR" \
-    --model "$TOKENIZER_MODEL" \
-    --served-model-name "$SERVED_MODEL_NAME" \
-    --context-length "$CONTEXT_LENGTH" \
-    > "$LOG_DIR/worker-prefill.log" 2>&1 &
-PIDS+=($!)
-
-log "starting Dynamo DECODE worker..."
-python -m dynamo.megatron \
-    --role decode \
-    --coordinator-addr "$DECODE_COORD_ADDR" \
-    --model "$TOKENIZER_MODEL" \
-    --served-model-name "$SERVED_MODEL_NAME" \
-    --context-length "$CONTEXT_LENGTH" \
-    > "$LOG_DIR/worker-decode.log" 2>&1 &
-PIDS+=($!)
-
-# Both workers are "ready" when their _core binding registers the model card.
 wait_for "prefill worker registered" 300 \
     grep -q "Registered base model" "$LOG_DIR/worker-prefill.log" \
     || die "prefill worker never registered (see $LOG_DIR/worker-prefill.log)"
@@ -249,13 +207,13 @@ wait_for "frontend exposes $SERVED_MODEL_NAME" 60 \
 cat > /tmp/phase3.env <<ENV
 export NATS_SERVER="$NATS_SERVER"
 export ETCD_ENDPOINTS="$ETCD_ENDPOINTS"
-export MEGATRON_PREFILL_COORDINATOR_ADDR="$PREFILL_COORD_ADDR"
-export MEGATRON_DECODE_COORDINATOR_ADDR="$DECODE_COORD_ADDR"
+export MEGATRON_PREFILL_COORDINATOR_ADDR="tcp://127.0.0.1:$COORD_PORT_PREFILL"
+export MEGATRON_DECODE_COORDINATOR_ADDR="tcp://127.0.0.1:$COORD_PORT_DECODE"
 export PHASE3_FRONTEND_URL="http://127.0.0.1:$HTTP_PORT"
 export PHASE3_MODEL_NAME="$SERVED_MODEL_NAME"
 export PHASE3_LOG_DIR="$LOG_DIR"
-export PHASE3_PREFILL_LOG="$LOG_DIR/coordinator-prefill.log"
-export PHASE3_DECODE_LOG="$LOG_DIR/coordinator-decode.log"
+export PHASE3_PREFILL_LOG="$LOG_DIR/worker-prefill.log"
+export PHASE3_DECODE_LOG="$LOG_DIR/worker-decode.log"
 ENV
 
 log "all components healthy. test endpoint: http://127.0.0.1:$HTTP_PORT"

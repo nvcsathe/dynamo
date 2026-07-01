@@ -24,7 +24,7 @@ class BasePlannerDefaults:
     # Namespace from DYN_NAMESPACE env var (injected by operator as "{k8s_namespace}-{dgd_name}")
     namespace = os.environ.get("DYN_NAMESPACE", "dynamo")
     environment: Literal["kubernetes", "virtual", "global-planner"] = "kubernetes"
-    backend: Literal["vllm", "sglang", "trtllm", "mocker"] = "vllm"
+    backend: Literal["vllm", "sglang", "trtllm", "mocker", "megatron"] = "vllm"
     log_dir = None
     throughput_adjustment_interval_seconds = 180
     max_gpu_budget = 8

@@ -1,12 +1,9 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 
-"""CLI argument parsing for the Megatron backend (Phase 0).
+"""Arguments shared by the Megatron launcher and unified backend."""
 
-Only the arguments required for aggregated, streaming generation against an
-externally-launched Megatron coordinator are defined here. Disagg, KV events,
-and metrics arguments will be added in later phases.
-"""
+from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
@@ -14,93 +11,73 @@ from dataclasses import dataclass
 
 @dataclass
 class Config:
-    coordinator_addr: str
     model: str
-    served_model_name: str | None
-    context_length: int
+    served_model_name: str
     namespace: str
     component: str
     endpoint: str
     discovery_backend: str
     request_plane: str
-    event_plane: str
-    role: str  # "aggregated" | "prefill" | "decode"
+    event_plane: str | None
+    role: str
+    nproc_per_node: int
+    coordinator_host: str | None
+    coordinator_port: int | None
+    kv_transfer_listen_addr: str | None
+    megatron_root: str
+    drain_timeout: float
+    megatron_argv: list[str]
+
+
+def _split_argv(argv: list[str]) -> tuple[list[str], list[str]]:
+    if "--" not in argv:
+        return argv, []
+    separator = argv.index("--")
+    return argv[:separator], argv[separator + 1 :]
 
 
 def parse_args(argv: list[str] | None = None) -> Config:
+    import sys
+
+    dynamo_argv, megatron_argv = _split_argv(list(sys.argv[1:] if argv is None else argv))
     parser = argparse.ArgumentParser(
         prog="python -m dynamo.megatron",
-        description=(
-            "Dynamo worker that proxies requests to a Megatron-LM "
-            "DataParallelInferenceCoordinator launched separately via "
-            "tools/run_dynamic_text_generation_server.py --frontend dynamo."
-        ),
+        description="Launch one DP=1 Megatron rank group as a Dynamo backend worker.",
     )
-    parser.add_argument(
-        "--coordinator-addr",
-        required=True,
-        help=(
-            "ZMQ ROUTER address of the Megatron coordinator, e.g. "
-            "tcp://10.0.0.1:5555. Read from the MEGATRON_COORDINATOR_ADDR=<addr> "
-            "line printed by the Megatron launcher on stdout."
-        ),
-    )
-    parser.add_argument(
-        "--model",
-        required=True,
-        help=(
-            "HuggingFace model id or local path used by the Dynamo frontend to "
-            "load the tokenizer + config.json. Must match the tokenizer the "
-            "Megatron engine was built with."
-        ),
-    )
-    parser.add_argument(
-        "--served-model-name",
-        default=None,
-        help="Display name advertised to clients. Defaults to --model.",
-    )
-    parser.add_argument(
-        "--context-length",
-        type=int,
-        default=4096,
-        help="Max context length to advertise on the model card.",
-    )
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--served-model-name", default=None)
     parser.add_argument("--namespace", default="dynamo")
-    parser.add_argument(
-        "--component",
-        default=None,
-        help=(
-            "Dynamo component name. Defaults to 'backend' for aggregated/decode "
-            "and 'prefill' for --role prefill."
-        ),
-    )
+    parser.add_argument("--component", default=None)
     parser.add_argument("--endpoint", default="generate")
     parser.add_argument("--discovery-backend", default="etcd")
     parser.add_argument("--request-plane", default="nats")
     parser.add_argument("--event-plane", default="nats")
     parser.add_argument(
-        "--role",
-        choices=["aggregated", "prefill", "decode"],
-        default="aggregated",
-        help=(
-            "Disagg role. 'aggregated' (default) keeps Phase-0 behavior. "
-            "'prefill' registers as a PrefillWorker that returns disaggregated_params; "
-            "'decode' rejects requests without prefill_result and imports KV."
-        ),
+        "--role", choices=["aggregated", "prefill", "decode"], default="aggregated"
     )
-    args = parser.parse_args(argv)
+    parser.add_argument("--nproc-per-node", type=int, required=True)
+    parser.add_argument("--coordinator-host", default=None)
+    parser.add_argument("--coordinator-port", type=int, default=None)
+    parser.add_argument("--kv-transfer-listen-addr", default=None)
+    parser.add_argument("--megatron-root", default="/opt/megatron-lm")
+    parser.add_argument("--drain-timeout", type=float, default=30.0)
+    args = parser.parse_args(dynamo_argv)
 
-    # Default the component name to match the role so the frontend's
-    # PrefillRouter can find each worker on its expected NATS subject.
+    if args.nproc_per_node < 1:
+        parser.error("--nproc-per-node must be at least 1")
+    if not megatron_argv:
+        parser.error("Megatron arguments are required after '--'")
+    if args.role in ("prefill", "decode") and not args.kv_transfer_listen_addr:
+        parser.error("disaggregated roles require --kv-transfer-listen-addr")
+    if args.role in ("prefill", "decode") and not args.coordinator_host:
+        parser.error("disaggregated roles require a routable --coordinator-host")
+
     component = args.component
     if component is None:
         component = "prefill" if args.role == "prefill" else "backend"
-
     return Config(
-        coordinator_addr=args.coordinator_addr,
         model=args.model,
         served_model_name=args.served_model_name or args.model,
-        context_length=args.context_length,
         namespace=args.namespace,
         component=component,
         endpoint=args.endpoint,
@@ -108,4 +85,11 @@ def parse_args(argv: list[str] | None = None) -> Config:
         request_plane=args.request_plane,
         event_plane=args.event_plane,
         role=args.role,
+        nproc_per_node=args.nproc_per_node,
+        coordinator_host=args.coordinator_host,
+        coordinator_port=args.coordinator_port,
+        kv_transfer_listen_addr=args.kv_transfer_listen_addr,
+        megatron_root=args.megatron_root,
+        drain_timeout=args.drain_timeout,
+        megatron_argv=megatron_argv,
     )

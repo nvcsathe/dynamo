@@ -64,7 +64,9 @@ class PlannerConfig(BaseModel):
         default_factory=lambda: os.environ.get("DYN_NAMESPACE", "dynamo"),
         exclude=True,
     )
-    backend: Literal["vllm", "sglang", "trtllm", "mocker"] = SLAPlannerDefaults.backend
+    backend: Literal["vllm", "sglang", "trtllm", "mocker", "megatron"] = (
+        SLAPlannerDefaults.backend
+    )
     mode: Literal["disagg", "prefill", "decode", "agg"] = SLAPlannerDefaults.mode
     optimization_target: Literal["throughput", "latency", "load", "sla"] = Field(
         default="throughput",

@@ -370,6 +370,22 @@ impl KvEventPublisher {
         })
     }
 
+    fn publish_all_cleared(&self, py: Python) -> PyResult<()> {
+        let dp_rank = self.dp_rank;
+        let inner = self.inner.clone();
+        let event_id = inner.next_event_id();
+
+        py.allow_threads(|| {
+            inner
+                .publish(KvCacheEvent {
+                    event_id,
+                    data: KvCacheEventData::Cleared,
+                    dp_rank,
+                })
+                .map_err(to_pyerr)
+        })
+    }
+
     fn shutdown(&mut self) {
         // If no other Arc clones exist, shut down eagerly.
         // Otherwise the Drop impl handles cleanup when the last reference is freed.

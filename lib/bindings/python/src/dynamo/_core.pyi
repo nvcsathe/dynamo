@@ -1032,6 +1032,10 @@ class KvEventPublisher:
         """
         ...
 
+    def publish_all_cleared(self) -> None:
+        """Publish an event invalidating every KV block for this worker."""
+        ...
+
     def shutdown(self) -> None:
         """
         Shuts down the event publisher, stopping any background tasks.

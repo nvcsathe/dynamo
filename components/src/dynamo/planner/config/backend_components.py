@@ -73,9 +73,19 @@ class MockerComponentName(ComponentName):
     decode_worker_endpoint = "generate"
 
 
+class MegatronComponentName(ComponentName):
+    prefill_worker_k8s_name = "MegatronPrefillWorker"
+    prefill_worker_component_name = "prefill"
+    prefill_worker_endpoint = "generate"
+    decode_worker_k8s_name = "MegatronDecodeWorker"
+    decode_worker_component_name = "backend"
+    decode_worker_endpoint = "generate"
+
+
 WORKER_COMPONENT_NAMES: dict[str, type[ComponentName]] = {
     "vllm": VllmComponentName,
     "sglang": SGLangComponentName,
     "trtllm": TrtllmComponentName,
     "mocker": MockerComponentName,
+    "megatron": MegatronComponentName,
 }

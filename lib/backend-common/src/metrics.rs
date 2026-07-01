@@ -176,6 +176,8 @@ pub struct ComponentGauges {
     total_blocks: prometheus::IntGaugeVec,
     gpu_cache_usage_percent: prometheus::GaugeVec,
     kv_cache_hit_rate: prometheus::GaugeVec,
+    active_requests: prometheus::IntGaugeVec,
+    waiting_requests: prometheus::IntGaugeVec,
 }
 
 impl ComponentGauges {
@@ -220,15 +222,27 @@ impl ComponentGauges {
             "kv_cache_hit_rate",
             "Prefix cache hit rate (0.0-1.0). Portable across engines.",
         )?;
+        let active_requests = build_int(
+            "active_requests",
+            "Requests currently active on the engine.",
+        )?;
+        let waiting_requests = build_int(
+            "waiting_requests",
+            "Requests currently waiting for engine capacity.",
+        )?;
         for &rank in dp_ranks {
             let r = rank.to_string();
             total_blocks.with_label_values(&[&r]).set(0);
             gpu_cache_usage_percent.with_label_values(&[&r]).set(0.0);
+            active_requests.with_label_values(&[&r]).set(0);
+            waiting_requests.with_label_values(&[&r]).set(0);
         }
         Ok(Self {
             total_blocks,
             gpu_cache_usage_percent,
             kv_cache_hit_rate,
+            active_requests,
+            waiting_requests,
         })
     }
 
@@ -251,6 +265,12 @@ impl ComponentGauges {
                 .with_label_values(&[&rank])
                 .set(hr as f64);
         }
+        self.active_requests
+            .with_label_values(&[&rank])
+            .set(snap.active_requests as i64);
+        self.waiting_requests
+            .with_label_values(&[&rank])
+            .set(snap.waiting_requests as i64);
     }
 }
 

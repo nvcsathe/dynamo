@@ -58,6 +58,8 @@ class ComponentSnapshot:
     gpu_cache_usage: float
     dp_rank: int
     kv_cache_hit_rate: Optional[float] = None
+    active_requests: int = 0
+    waiting_requests: int = 0
 
 
 KvEventSource = Union[ZmqSource, PushSource]

@@ -94,10 +94,11 @@ your own copy. The checkpoint is consumed only by `orchestrate.sh` (via
 `--load`); `verify_mamba.sh` just hits the running HTTP endpoint and needs
 nothing checkpoint-related.
 
-By default, the test does not pass Megatron `--tokenizer-model`; with
-`--use-checkpoint-args`, Megatron reads the tokenizer settings from the
-checkpoint args. Set `TOKENIZER_MODEL` only when you need to override that with
-an explicit vocab file. Dynamo's worker registration is separate: use
+The checkpoint restores Megatron's native tiktoken vocabulary from an absolute
+Lustre path. `TOKENIZER_MODEL` defaults to that same `*.vocab.json`, and the
+launcher mounts its parent directory into the container before passing it as
+`--tokenizer-model`. Override it when your checkpoint's vocabulary lives
+elsewhere. Dynamo's worker registration is separate: use
 `DYNAMO_MODEL` for the model directory / HF id with `config.json` and tokenizer
 metadata. It defaults to `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16`. Do not
 point it at the Megatron `nanov3` pretrained directory unless that directory
@@ -141,7 +142,7 @@ attention KV and Mamba conv/SSM state layout matched rank-to-rank.
 | --- | --- | --- |
 | `MODEL_CHECKPOINT` | `…/ksanthanam/nemotron-3-nano-30b` | mcore checkpoint served via `--load` |
 | `PRETRAINED_CHECKPOINT` | `…/ksanthanam/nanov3` | `--pretrained-checkpoint` source |
-| `TOKENIZER_MODEL` | _(unset)_ | optional Megatron `--tokenizer-model` override; unset uses checkpoint args |
+| `TOKENIZER_MODEL` | `…/multiMixV8….vocab.json` | native Megatron tokenizer path; its parent is mounted into the container |
 | `DYNAMO_MODEL` | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` | model dir / HF id passed to Dynamo `--model` |
 | `PREFLIGHT_ONLY` | `0` | set to `1` to resolve/validate tokenizer metadata and exit before GPU startup |
 | `INFER_BUFFER_GB` | `20` | dynamic-batching KV buffer budget per engine |

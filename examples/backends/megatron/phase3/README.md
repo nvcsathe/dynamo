@@ -79,13 +79,15 @@ nats + etcd ── dynamo.frontend
                                        required for the prefill-skip path)
 ```
 
-A request flows: frontend → `PrefillRouter` → prefill worker → prefill engine
+A request flows: frontend → `PrefillRouter` → prefill endpoint → prefill engine
 runs prefill only, pins KV blocks, returns `disaggregated_params` → frontend
-forwards `prefill_result` → decode worker → decode engine NIXL-pulls the KV
+forwards `prefill_result` → decode endpoint → decode engine NIXL-pulls the KV
 blocks, registers their hashes, then `add_request` finds them as
-prefix-matched → decode worker tells the prefill coordinator to unpin the
+prefix-matched → decode tells the prefill engine's private coordinator to unpin the
 source KV blocks so they are LRU-reusable → decode computes the first output
-token and streams tokens back.
+token and streams tokens back. Each endpoint is launched by one
+`python -m dynamo.megatron` command; individual model-parallel ranks are not
+registered with Dynamo.
 
 ## Run
 
@@ -101,9 +103,8 @@ bash test_phase3.sh
 pytest -q test_phase3.py
 ```
 
-By default both engines run TP=1 → 2 GPUs total. Set `TP_PREFILL=$N
-TP_DECODE=$N` to scale. They MUST match (the NIXL transfer pairs rank N to
-rank N).
+By default both engines run TP=1 → 2 GPUs total. Set `TP_PREFILL` and
+`TP_DECODE` to change the complete rank-group sizes.
 
 ## Configuration knobs
 
@@ -111,7 +112,7 @@ rank N).
 | --- | --- | --- |
 | `MODEL_CHECKPOINT` | `$STAGE/models/llama3.1-8b-instruct-mcore` | mcore-format checkpoint |
 | `TOKENIZER_MODEL` | `meta-llama/Llama-3.1-8B-Instruct` | HF id for tokenizer (Instruct variant — base has no `chat_template`, see `[[project_phase0_stack_quirks]]`) |
-| `TP_PREFILL` / `TP_DECODE` | `1` | Must match. PP=1 hard-coded. |
+| `TP_PREFILL` / `TP_DECODE` | `1` | GPUs per TP dimension; may differ when the Megatron revision supports KV re-sharding. |
 | `COORD_PORT_PREFILL` / `COORD_PORT_DECODE` | `5555` / `5556` | Coordinator ZMQ. |
 | `NIXL_PORT_PREFILL` / `NIXL_PORT_DECODE` | `7000` / `7001` | NIXL listen sockets — must be distinct. |
 | `HTTP_PORT` | `8100` | Frontend. |
@@ -123,10 +124,10 @@ rank N).
    back is strong evidence the whole pipeline works — broken NIXL or broken
    KV import would produce garbage or crash, not a coherent stream.)
 3. `DISAGG_PREFILL_HANDOFF request_id=... pinned_blocks=N` is present in
-   `coordinator-prefill.log`. Proves the prefill engine pinned blocks and
+   `worker-prefill.log`. Proves the prefill engine pinned blocks and
    emitted `disaggregated_params`.
 4. `DISAGG_DECODE_IMPORT request_id=... prompt_tokens=... imported_blocks=N
-   hashes_registered=M` is present in `coordinator-decode.log`. Proves the
+   hashes_registered=M` is present in `worker-decode.log`. Proves the
    decode engine took the NIXL-import path **and registered hashes so the
    prefix-cache match could skip prefill**. `hashes_registered > 0` is the
    load-bearing assertion — without it, NIXL might transfer but prefill
@@ -142,10 +143,8 @@ subjects (`dynamo.prefill.generate` and `dynamo.backend.generate`).
 
 - **One node only.** Multi-node will work in principle (NIXL handles RDMA);
   the orchestrator just doesn't lay it out. Extend with srun for that.
-- **TP/PP must match.** PP=1 is hard-coded; lifting this requires per-layer
-  NIXL routing on the decode side.
-- **Single DP per role.** Multi-DP-aware routing of the handoff payload is
-  a follow-up.
+- **DP is exactly one per command.** Scale horizontally by adding complete
+  Dynamo component replicas.
 - **The "partial-block-at-tail" case still does ~1 block of prefill work
   on decode.** Block hashes only cover whole blocks, so any tokens beyond
   the last whole-block boundary go through the normal prefill path. For

@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Phase-0 orchestrator. Runs INSIDE the dynamo-megatron container.
-# Brings up NATS, etcd, the Megatron coordinator (TP=2), the Dynamo
-# Megatron worker, and the Dynamo frontend — in order, waiting for each
+# Brings up NATS, etcd, one self-owned Dynamo Megatron engine (TP=2),
+# and the Dynamo frontend — in order, waiting for each
 # to be healthy before launching the next. Blocks until Ctrl-C or one
 # of the long-running processes dies.
 #
 # Outputs:
 #   - /tmp/phase0.env       : env-vars sourced by test scripts
-#   - /tmp/{nats,etcd,coordinator,worker,frontend}.log
+#   - /tmp/{nats,etcd,worker,frontend}.log
 #   - On stdout: a single "PHASE0_READY" line once the frontend serves
 #     /v1/models with the target model registered.
 
@@ -81,7 +81,7 @@ wait_for "nats /healthz"  30 curl -sf http://127.0.0.1:8222/healthz || die "nats
 wait_for "etcd /health"   30 curl -sf http://127.0.0.1:2379/health  || die "etcd never healthy"
 
 ###############################################################################
-# 2. Megatron coordinator (torchrun TP=$TP)
+# 2. Self-owned Dynamo Megatron engine (TP=$TP)
 ###############################################################################
 # Model-architecture flags. Lifted verbatim from
 # Megatron-LM/examples/inference/llama_mistral/run_text_generation_llama3.1.sh
@@ -115,46 +115,28 @@ MODEL_ARGS=(
     --bf16
 )
 
-log "starting Megatron coordinator (TP=$TP, model=$MODEL_CHECKPOINT)..."
+log "starting owned Dynamo Megatron engine (TP=$TP, model=$MODEL_CHECKPOINT)..."
 (
-    cd /opt/megatron-lm
-    exec python -m torch.distributed.run \
-        --nnodes=1 --nproc-per-node="$TP" --node-rank=0 \
-        --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT" \
-        tools/run_dynamic_text_generation_server.py \
-            --frontend dynamo \
-            --inference-coordinator-port "$COORD_PORT" \
+    exec python -m dynamo.megatron \
+            --role aggregated \
+            --model "$TOKENIZER_MODEL" \
+            --served-model-name "$SERVED_MODEL_NAME" \
+            --nproc-per-node "$TP" \
+            --coordinator-host 127.0.0.1 \
+            --coordinator-port "$COORD_PORT" \
+            --megatron-root /opt/megatron-lm \
+            -- \
             --tensor-model-parallel-size "$TP" \
             --pipeline-model-parallel-size 1 \
+            --inference-dynamic-batching-prefix-caching \
             --load "$MODEL_CHECKPOINT" \
             --tokenizer-type HuggingFaceTokenizer \
             --tokenizer-model "$TOKENIZER_MODEL" \
             "${MODEL_ARGS[@]}"
-) > "$LOG_DIR/coordinator.log" 2>&1 &
+) > "$LOG_DIR/worker.log" 2>&1 &
 PIDS+=($!)
 
-wait_for "coordinator address" 600 grep -q "MEGATRON_COORDINATOR_ADDR=" "$LOG_DIR/coordinator.log" \
-    || die "coordinator never announced (see $LOG_DIR/coordinator.log)"
-
-COORD_ADDR=$(grep -m1 -oP 'MEGATRON_COORDINATOR_ADDR=\K\S+' "$LOG_DIR/coordinator.log")
-log "coordinator at $COORD_ADDR"
-
-###############################################################################
-# 3. Dynamo Megatron worker
-###############################################################################
-log "starting Dynamo Megatron worker..."
-python -m dynamo.megatron \
-    --coordinator-addr "$COORD_ADDR" \
-    --model "$TOKENIZER_MODEL" \
-    --served-model-name "$SERVED_MODEL_NAME" \
-    --context-length "$CONTEXT_LENGTH" \
-    > "$LOG_DIR/worker.log" 2>&1 &
-PIDS+=($!)
-
-# Worker is "ready" when the Rust _core binding has registered the model
-# card. The 300 s budget accounts for first-time HuggingFace tokenizer
-# downloads via ModelExpress (~60 s for an 8B model).
-wait_for "worker registered" 300 \
+wait_for "worker registered" 600 \
     grep -q "Registered base model" "$LOG_DIR/worker.log" \
     || die "worker never registered (see $LOG_DIR/worker.log)"
 
@@ -184,7 +166,7 @@ wait_for "frontend exposes $SERVED_MODEL_NAME" 60 \
 cat > /tmp/phase0.env <<ENV
 export NATS_SERVER="$NATS_SERVER"
 export ETCD_ENDPOINTS="$ETCD_ENDPOINTS"
-export MEGATRON_COORDINATOR_ADDR="$COORD_ADDR"
+export MEGATRON_COORDINATOR_ADDR="tcp://127.0.0.1:$COORD_PORT"
 export PHASE0_FRONTEND_URL="http://127.0.0.1:$HTTP_PORT"
 export PHASE0_MODEL_NAME="$SERVED_MODEL_NAME"
 ENV

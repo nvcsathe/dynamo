@@ -162,6 +162,8 @@ fn spawn_mocker_snapshot_loop(
                         kv_total_blocks: 0,
                         gpu_cache_usage: 0.0,
                         kv_cache_hit_rate: None,
+                        active_requests: 0,
+                        waiting_requests: 0,
                         dp_rank: DP_RANK,
                     });
                 }

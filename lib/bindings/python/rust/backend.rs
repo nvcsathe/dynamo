@@ -1017,11 +1017,23 @@ impl PySnapshotPublisher {
             Ok(v) => v.extract().ok(),
             Err(_) => None,
         };
+        let active_requests: u64 = snapshot
+            .getattr("active_requests")
+            .ok()
+            .and_then(|value| value.extract().ok())
+            .unwrap_or(0);
+        let waiting_requests: u64 = snapshot
+            .getattr("waiting_requests")
+            .ok()
+            .and_then(|value| value.extract().ok())
+            .unwrap_or(0);
         let snap = ComponentSnapshot {
             kv_used_blocks,
             kv_total_blocks,
             gpu_cache_usage,
             kv_cache_hit_rate,
+            active_requests,
+            waiting_requests,
             dp_rank,
         };
         let inner = self.inner.clone();

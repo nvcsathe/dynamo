@@ -225,7 +225,7 @@ class LLMEngine(ABC):
         retain ``metrics`` past return.
 
         Framework-owned lifecycle + per-rank gauges
-        (``dynamo_component_{cleanup_time_seconds,drain_time_seconds,model_load_time_seconds,total_blocks,gpu_cache_usage_percent,kv_cache_hit_rate}``)
+        (``dynamo_component_{cleanup_time_seconds,drain_time_seconds,model_load_time_seconds,total_blocks,gpu_cache_usage_percent,kv_cache_hit_rate,active_requests,waiting_requests}``)
         are owned and registered by the framework Rust-side — they do NOT
         require the engine to implement this method."""
 

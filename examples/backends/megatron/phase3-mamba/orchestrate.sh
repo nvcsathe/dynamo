@@ -43,11 +43,11 @@ STAGE="${STAGE:-/lustre/fsw/portfolios/nemotron/users/csathe}"
 # already live on the cluster; override only if you staged your own copy.
 #   MODEL_CHECKPOINT      -> --load (the mcore dist checkpoint to serve)
 #   PRETRAINED_CHECKPOINT -> --pretrained-checkpoint
-#   TOKENIZER_MODEL       -> optional --tokenizer-model override
+#   TOKENIZER_MODEL       -> Megatron tiktoken vocab restored by the checkpoint
 #   DYNAMO_MODEL          -> Dynamo frontend model dir / HF id (config + tokenizer)
 MODEL_CHECKPOINT="${MODEL_CHECKPOINT:-/lustre/fsw/portfolios/llmservice/users/ksanthanam/nemotron-3-nano-30b}"
 PRETRAINED_CHECKPOINT="${PRETRAINED_CHECKPOINT:-/lustre/fsw/portfolios/llmservice/users/ksanthanam/nanov3}"
-TOKENIZER_MODEL="${TOKENIZER_MODEL:-}"
+TOKENIZER_MODEL="${TOKENIZER_MODEL:-/lustre/fsw/portfolios/llmservice/projects/llmservice_nlp_fm/nemotron6/tokenizers/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json}"
 DYNAMO_MODEL="${DYNAMO_MODEL:-nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-nemotron3-nano}"
 PREFLIGHT_ONLY="${PREFLIGHT_ONLY:-0}"
@@ -151,6 +151,8 @@ fi
 if [[ -e "$DYNAMO_MODEL" && ! -d "$DYNAMO_MODEL" ]]; then
     die "DYNAMO_MODEL must be a directory or HF model id for Dynamo registration (got file: $DYNAMO_MODEL)"
 fi
+[[ -f "$TOKENIZER_MODEL" ]] \
+    || die "Megatron TOKENIZER_MODEL is not visible in the container: $TOKENIZER_MODEL (set TOKENIZER_MODEL to the checkpoint vocab and mount its parent directory)"
 
 log "Hybrid disagg (Mamba transfer): TP=1 PP=1 EP=$ROLE_EP_SIZE; prefill GPUs=$GPU_PREFILL, decode GPUs=$GPU_DECODE; baseline=$WITH_BASELINE (GPUs=$GPU_BASELINE)"
 
@@ -172,7 +174,11 @@ resolve_dynamo_metadata() {
     fi
 
     python -c \
-        'import asyncio, sys; from dynamo.llm import fetch_model; print(asyncio.run(fetch_model(sys.argv[1], ignore_weights=True)))' \
+        'import asyncio, sys
+from dynamo.llm import fetch_model
+async def main():
+    return await fetch_model(sys.argv[1], ignore_weights=True)
+print(asyncio.run(main()))' \
         "$DYNAMO_MODEL"
 }
 
@@ -258,24 +264,29 @@ if [[ "$PREFIX_CACHE" == "1" ]]; then
     )
 fi
 TOKENIZER_ARGS=()
-if [[ -n "$TOKENIZER_MODEL" ]]; then
-    TOKENIZER_ARGS=(--tokenizer-model "$TOKENIZER_MODEL")
-fi
+TOKENIZER_ARGS=(--tokenizer-model "$TOKENIZER_MODEL")
 
-# Launch one Megatron coordinator. Args: role gpus master_port coord_port log
-# [extra args...]. Each role uses ROLE_EP_SIZE processes and EP shards.
-launch_coordinator() {
-    local role="$1" gpus="$2" master_port="$3" coord_port="$4" logf="$5"; shift 5
+# Launch one owned Dynamo Megatron engine. Args:
+# role gpus coordinator_port nixl_port log [Megatron args...].
+launch_engine() {
+    local role="$1" gpus="$2" coord_port="$3" nixl_port="$4" logf="$5"; shift 5
     local nproc="$ROLE_EP_SIZE"
-    log "starting Megatron $role coordinator (GPUs=$gpus, TP=1 PP=1 EP=$ROLE_EP_SIZE)..."
+    local transfer_args=()
+    if [[ "$role" != "aggregated" ]]; then
+        transfer_args=(--kv-transfer-listen-addr "127.0.0.1:$nixl_port")
+    fi
+    log "starting owned Megatron $role engine (GPUs=$gpus, TP=1 PP=1 EP=$ROLE_EP_SIZE)..."
     (
-        cd /opt/megatron-lm
-        CUDA_VISIBLE_DEVICES="$gpus" exec python -m torch.distributed.run \
-            --nnodes=1 --nproc-per-node="$nproc" --node-rank=0 \
-            --master-addr="$MASTER_ADDR" --master-port="$master_port" \
-            tools/run_dynamic_text_generation_server.py \
-                --frontend dynamo --disagg-role "$role" \
-                --inference-coordinator-port "$coord_port" \
+        CUDA_VISIBLE_DEVICES="$gpus" exec python -m dynamo.megatron \
+                --role "$role" \
+                --model "$DYNAMO_MODEL_METADATA" \
+                --served-model-name "$SERVED_MODEL_NAME" \
+                --nproc-per-node "$nproc" \
+                --coordinator-host 127.0.0.1 \
+                --coordinator-port "$coord_port" \
+                "${transfer_args[@]}" \
+                --megatron-root /opt/megatron-lm \
+                -- \
                 --tensor-model-parallel-size 1 \
                 --pipeline-model-parallel-size 1 \
                 --expert-model-parallel-size "$ROLE_EP_SIZE" \
@@ -303,47 +314,20 @@ wait_for "nats /healthz"  30 curl -sf http://127.0.0.1:8222/healthz || die "nats
 wait_for "etcd /health"   30 curl -sf http://127.0.0.1:2379/health  || die "etcd never healthy"
 
 ###############################################################################
-# 2. Disagg coordinators (prefill + decode). Both need the Mamba state cache.
+# 2. Disagg owned engines (prefill + decode). Both need the Mamba state cache.
 ###############################################################################
-launch_coordinator prefill "$GPU_PREFILL" "$MASTER_PORT_PREFILL" "$COORD_PORT_PREFILL" \
-    "$LOG_DIR/coordinator-prefill.log" \
-    --kv-transfer-listen-addr "0.0.0.0:$NIXL_PORT_PREFILL" \
+launch_engine prefill "$GPU_PREFILL" "$COORD_PORT_PREFILL" "$NIXL_PORT_PREFILL" \
+    "$LOG_DIR/worker-prefill.log" \
     "${PREFIX_ARGS[@]}"
 
-launch_coordinator decode "$GPU_DECODE" "$MASTER_PORT_DECODE" "$COORD_PORT_DECODE" \
-    "$LOG_DIR/coordinator-decode.log" \
-    --kv-transfer-listen-addr "0.0.0.0:$NIXL_PORT_DECODE" \
+launch_engine decode "$GPU_DECODE" "$COORD_PORT_DECODE" "$NIXL_PORT_DECODE" \
+    "$LOG_DIR/worker-decode.log" \
     "${PREFIX_ARGS[@]}"
 
-wait_for "prefill coordinator announced" 900 \
-    grep -q "MEGATRON_COORDINATOR_ADDR=" "$LOG_DIR/coordinator-prefill.log" \
-    || die "prefill coordinator never announced (see $LOG_DIR/coordinator-prefill.log)"
-wait_for "decode coordinator announced" 900 \
-    grep -q "MEGATRON_COORDINATOR_ADDR=" "$LOG_DIR/coordinator-decode.log" \
-    || die "decode coordinator never announced (see $LOG_DIR/coordinator-decode.log)"
-
-PREFILL_COORD_ADDR=$(grep -m1 -oP 'MEGATRON_COORDINATOR_ADDR=\K\S+' "$LOG_DIR/coordinator-prefill.log")
-DECODE_COORD_ADDR=$(grep -m1 -oP 'MEGATRON_COORDINATOR_ADDR=\K\S+' "$LOG_DIR/coordinator-decode.log")
-log "prefill coordinator at $PREFILL_COORD_ADDR"
-log "decode coordinator at $DECODE_COORD_ADDR"
-
-###############################################################################
-# 3. Disagg Dynamo workers + frontend
-###############################################################################
-log "starting Dynamo PREFILL worker..."
-python -m dynamo.megatron --role prefill --coordinator-addr "$PREFILL_COORD_ADDR" \
-    --model "$DYNAMO_MODEL_METADATA" --served-model-name "$SERVED_MODEL_NAME" \
-    --context-length "$CONTEXT_LENGTH" > "$LOG_DIR/worker-prefill.log" 2>&1 &
-PIDS+=($!)
-log "starting Dynamo DECODE worker..."
-python -m dynamo.megatron --role decode --coordinator-addr "$DECODE_COORD_ADDR" \
-    --model "$DYNAMO_MODEL_METADATA" --served-model-name "$SERVED_MODEL_NAME" \
-    --context-length "$CONTEXT_LENGTH" > "$LOG_DIR/worker-decode.log" 2>&1 &
-PIDS+=($!)
-wait_for "prefill worker registered" 300 \
+wait_for "prefill worker registered" 900 \
     grep -q "Registered base model" "$LOG_DIR/worker-prefill.log" \
     || die "prefill worker never registered (see $LOG_DIR/worker-prefill.log)"
-wait_for "decode worker registered" 300 \
+wait_for "decode worker registered" 900 \
     grep -q "Registered base model" "$LOG_DIR/worker-decode.log" \
     || die "decode worker never registered (see $LOG_DIR/worker-decode.log)"
 
@@ -356,25 +340,13 @@ wait_for "frontend exposes $SERVED_MODEL_NAME" 60 \
     || die "frontend never exposed model (see $LOG_DIR/frontend.log)"
 
 ###############################################################################
-# 4. Optional aggregated baseline stack (own coordinator + worker + frontend).
+# 4. Optional aggregated baseline stack (one owned engine + frontend).
 ###############################################################################
 BASELINE_URL=""
 if [[ "$WITH_BASELINE" == "1" ]]; then
-    launch_coordinator aggregated "$GPU_BASELINE" "$MASTER_PORT_AGG" "$COORD_PORT_AGG" \
-        "$LOG_DIR/coordinator-agg.log"
-    wait_for "baseline coordinator announced" 900 \
-        grep -q "MEGATRON_COORDINATOR_ADDR=" "$LOG_DIR/coordinator-agg.log" \
-        || die "baseline coordinator never announced (see $LOG_DIR/coordinator-agg.log)"
-    AGG_COORD_ADDR=$(grep -m1 -oP 'MEGATRON_COORDINATOR_ADDR=\K\S+' "$LOG_DIR/coordinator-agg.log")
-    log "baseline coordinator at $AGG_COORD_ADDR"
-
-    log "starting Dynamo AGG worker..."
-    DYN_NAMESPACE=baseline python -m dynamo.megatron --role aggregated \
-        --coordinator-addr "$AGG_COORD_ADDR" \
-        --model "$DYNAMO_MODEL_METADATA" --served-model-name "$SERVED_MODEL_NAME" \
-        --context-length "$CONTEXT_LENGTH" > "$LOG_DIR/worker-agg.log" 2>&1 &
-    PIDS+=($!)
-    wait_for "agg worker registered" 300 \
+    DYN_NAMESPACE=baseline launch_engine aggregated "$GPU_BASELINE" "$COORD_PORT_AGG" "" \
+        "$LOG_DIR/worker-agg.log"
+    wait_for "agg worker registered" 900 \
         grep -q "Registered base model" "$LOG_DIR/worker-agg.log" \
         || die "agg worker never registered (see $LOG_DIR/worker-agg.log)"
 
@@ -396,8 +368,8 @@ export PHASE3_FRONTEND_URL="http://127.0.0.1:$HTTP_PORT"
 export PHASE3_BASELINE_URL="$BASELINE_URL"
 export PHASE3_MODEL_NAME="$SERVED_MODEL_NAME"
 export PHASE3_LOG_DIR="$LOG_DIR"
-export PHASE3_PREFILL_LOG="$LOG_DIR/coordinator-prefill.log"
-export PHASE3_DECODE_LOG="$LOG_DIR/coordinator-decode.log"
+export PHASE3_PREFILL_LOG="$LOG_DIR/worker-prefill.log"
+export PHASE3_DECODE_LOG="$LOG_DIR/worker-decode.log"
 ENV
 
 log "all components healthy."
