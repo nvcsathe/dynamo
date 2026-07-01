@@ -156,6 +156,7 @@ class MegatronLLMEngine(LLMEngine):
 
         readiness = await self._wait_for_readiness(ready_path)
         from megatron.core.inference.inference_client import InferenceClient
+        from megatron.inference.integrations.dynamo.protocol import PROTOCOL_VERSION
 
         self.client = InferenceClient(
             str(readiness["coordinator_address"]), deserialize=False
@@ -166,10 +167,10 @@ class MegatronLLMEngine(LLMEngine):
         )
         self._metadata = dict(self.client.metadata)
         protocol_version = int(self._metadata.get("protocol_version", 0))
-        if protocol_version != 1:
+        if protocol_version != PROTOCOL_VERSION:
             raise RuntimeError(
                 "Megatron coordinator protocol mismatch: "
-                f"expected 1, got {protocol_version}"
+                f"expected {PROTOCOL_VERSION}, got {protocol_version}"
             )
         self.client.subscribe_telemetry(
             metrics_listener=self._on_metrics,
@@ -198,7 +199,7 @@ class MegatronLLMEngine(LLMEngine):
             "--standalone",
             f"--nproc-per-node={self.config.nproc_per_node}",
             "--module",
-            "megatron.inference.dynamic_server",
+            "megatron.inference.integrations.dynamo.engine_service",
             "--dynamo-ready-file",
             str(ready_path),
             "--dynamo-role",
@@ -495,11 +496,14 @@ class MegatronLLMEngine(LLMEngine):
         self._snapshot_publisher = publisher
 
     def _on_kv_event(self, rank: int, kind: str, payload: dict) -> None:
-        if rank != 0:
+        from megatron.inference.integrations.dynamo.telemetry import (
+            authoritative_kv_event,
+        )
+
+        event = authoritative_kv_event(rank, kind, payload)
+        if event is None:
             return
-        event = dict(payload)
-        event.pop("source_global_rank", None)
-        self._kv_queue.put((kind, event))
+        self._kv_queue.put(event)
 
     def _start_publisher_thread(self, publisher: KvEventPublisher) -> None:
         self._publisher_thread = threading.Thread(
@@ -532,17 +536,11 @@ class MegatronLLMEngine(LLMEngine):
             return
         if self._snapshot_publisher is None:
             return
-        total = int(stats.get("total_blocks") or 0)
-        used = int(stats.get("allocated_blocks") or 0)
+        from megatron.inference.integrations.dynamo.telemetry import (
+            logical_planner_snapshot_fields,
+        )
+
         self._snapshot_publisher.publish(
             0,
-            ComponentSnapshot(
-                kv_used_blocks=used,
-                kv_total_blocks=total,
-                gpu_cache_usage=float(stats.get("allocated_utilization") or 0.0),
-                kv_cache_hit_rate=stats.get("prefix_cache_hit_rate"),
-                dp_rank=0,
-                active_requests=int(stats.get("active_request_count") or 0),
-                waiting_requests=int(stats.get("waiting_request_count") or 0),
-            ),
+            ComponentSnapshot(**logical_planner_snapshot_fields(stats)),
         )

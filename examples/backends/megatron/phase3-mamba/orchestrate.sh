@@ -4,7 +4,7 @@
 # Validates that the Mamba conv/ssm recurrent state is handed off from prefill
 # to decode over NIXL alongside the attention KV cache. Without that transfer a
 # hybrid model silently decodes from ZERO Mamba state and produces wrong tokens
-# (see kv_transfer.py + dynamic_engine._import_mamba_handoff).
+# (see disaggregation/inference_state_handoff.py and transfer_backends/nixl.py).
 #
 #     NATS + etcd
 #     ├── Megatron coordinator [PREFILL]   (TP=1 PP=1 EP=2, GPUs 0,1)  --disagg-role prefill

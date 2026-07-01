@@ -6,19 +6,20 @@ instead of requiring a 1:1 rank match.
 
 ## What changed (vs phase3/)
 
-Megatron core (`megatron/core/inference/`):
-- `kv_transfer.py`
+Megatron core (`megatron/core/inference/disaggregation/`):
+- `transfer_backends/nixl.py`
   - `export_meta()` now also emits TP topology (`tp_size`, `tp_rank`,
     `num_kv_heads_global`, `heads_per_partition`, `head_dim`,
     `tokens_per_block`).
   - `pull_blocks()` accepts a **single** peer meta (matched layout → original
     whole-slice copy) **or a list** of per-rank metas → head-aware re-shard.
-  - `reshard_plan()` computes, per decode rank, which `(prefill_rank,
-    head_range)` fragments to pull by intersecting global KV-head ranges.
-  - `_pull_resharded()` issues one NIXL transfer per contributing prefill rank;
+  - The backend issues one NIXL transfer per contributing prefill rank;
     a head sub-range is strided across the `T` tokens of each `[T, H, d]` slice,
     so it emits one descriptor per `(block, outer, token)`.
-- `engines/dynamic_engine.py`
+- `kv_reshard.py`
+  - Computes, per decode rank, which `(prefill_rank, head_range)` fragments to
+    pull by intersecting global KV-head ranges.
+- `inference_state_handoff.py`
   - `setup_kv_transfer()` passes TP topology into `make_agent` and
     `all_gather_object`s every prefill rank's meta once at startup.
   - `_capture_handoff_meta()` ships that gathered list (TP>1) so a different-TP

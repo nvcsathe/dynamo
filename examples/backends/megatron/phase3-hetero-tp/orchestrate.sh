@@ -2,7 +2,8 @@
 # Heterogeneous-TP/PP disagg orchestrator. Identical to phase3/orchestrate.sh
 # EXCEPT it allows TP_PREFILL != TP_DECODE and PP_PREFILL != PP_DECODE. The KV
 # handoff re-shards KV heads across the TP boundary (see
-# megatron/core/inference/kv_transfer.py reshard_plan + _pull_resharded).
+# megatron/core/inference/disaggregation/kv_reshard.py and
+# disaggregation/transfer_backends/nixl.py).
 #
 #     NATS + etcd
 #     ├── Megatron coordinator [PREFILL]  (torchrun TP=$TP_PREFILL PP=$PP_PREFILL, GPUs 0..P-1)

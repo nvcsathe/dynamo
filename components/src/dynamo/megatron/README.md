@@ -11,6 +11,12 @@ replica. For MoE models this is measured by expert-DP because regular DP
 includes the EP-overlapped ranks. Dynamo routing and Planner scaling therefore
 operate on complete engines rather than individual model-parallel ranks.
 
+The Megatron-side integration is isolated under
+`megatron/inference/integrations/dynamo/`: `engine_service.py` is the torchrun
+entry point, `protocol.py` owns readiness and acknowledged lifecycle control,
+and `telemetry.py` owns rank-tagged metrics, logical Planner snapshots, and KV
+event normalization.
+
 ## Launch
 
 Pass Dynamo launcher arguments before `--` and normal Megatron arguments after
@@ -33,7 +39,8 @@ python -m dynamo.megatron \
 ```
 
 The parent follows the common `LLMEngine` entry point and launches
-`megatron.inference.dynamic_server` through `torch.distributed.run`. Every
+`megatron.inference.integrations.dynamo.engine_service` through
+`torch.distributed.run`. Every
 child rank initializes and loads Megatron, while the parent waits for an
 atomic readiness advertisement and coordinator metadata. Dynamo registration
 happens only after the coordinator, model-parallel ranks, and any NIXL agent
@@ -103,7 +110,7 @@ Confirm that the image contains both sides of the new boundary:
 ```bash
 docker run --rm "$IMAGE" python -c '
 from dynamo.megatron.llm_engine import MegatronLLMEngine
-from megatron.inference.dynamic_server import main
+from megatron.inference.integrations.dynamo.engine_service import main
 from megatron.core.inference.headers import Headers
 assert hasattr(Headers, "ENGINE_STATUS")
 print("Dynamo parent and Megatron engine service are present")
@@ -209,7 +216,7 @@ docker run --rm \
       tests/unit_tests/inference/test_inference_client.py \
       tests/unit_tests/inference/test_inference_client_streaming.py \
       tests/unit_tests/inference/test_data_parallel_inference_coordinator.py \
-      tests/unit_tests/inference/test_dynamic_server.py \
+      tests/unit_tests/inference/test_dynamo_engine_service.py \
       tests/unit_tests/inference/test_async_llm_streaming.py \
       tests/unit_tests/inference/test_kv_allocator_observers.py
   '

@@ -38,8 +38,8 @@
 #   UCX_LOG_FILE_OVERRIDE       log path; UCX expands %p to PID (default: /tmp/ucx_%p.log)
 #
 # If MEGATRON_LOCAL_DEV is set, the host directory it points to is mounted
-# over /opt/megatron-lm so you can edit InferenceClient / coordinator /
-# kv_transfer.py code without rebuilding the image.
+# over /opt/megatron-lm so you can edit InferenceClient, coordinator, and
+# disaggregation package code without rebuilding the image.
 #
 # Emits "PHASE3_HETERO_READY" on stdout when all components are healthy.
 
