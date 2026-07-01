@@ -42,34 +42,6 @@ def test_sampling_params_maps_greedy_and_limits():
     assert params.num_tokens_to_generate == 7
 
 
-@pytest.mark.asyncio
-async def test_start_advertises_real_engine_capacity():
-    metadata = SimpleNamespace(
-        context_length=8192,
-        block_size_tokens=64,
-        total_kv_blocks=1024,
-        max_requests=32,
-        max_tokens=4096,
-        coordinator_address="tcp://127.0.0.1:5555",
-        role="aggregated",
-    )
-    llm = SimpleNamespace(
-        metadata=metadata,
-        context=SimpleNamespace(enable_prefix_caching=True),
-        add_kv_event_listener=lambda callback: None,
-        add_metrics_listener=lambda callback: None,
-    )
-
-    async def initialize():
-        return llm
-
-    engine = MegatronLLMEngine(_config(), initialize)
-    result = await engine.start(1)
-    assert result.total_kv_blocks == 1024
-    assert result.kv_cache_block_size == 64
-    assert result.data_parallel_size == 1
-
-
 class _Context:
     def __init__(self, request_id="dynamo-request"):
         self.request_id = request_id
@@ -82,22 +54,30 @@ class _Context:
 async def test_decode_health_probe_bypasses_kv_handoff():
     handoff_called = False
 
-    async def output_stream(on_request_started):
-        on_request_started(31)
-        yield SimpleNamespace(token_ids=[9], finished=True)
+    class Stream:
+        request_id = 31
 
-    def generate_stream(_tokens, _params, on_request_started):
-        return output_stream(on_request_started)
+        def __aiter__(self):
+            return self
 
-    def generate_stream_with_kv_handoff(*_args, **_kwargs):
+        async def __anext__(self):
+            if getattr(self, "done", False):
+                raise StopAsyncIteration
+            self.done = True
+            return {"final": {"generated_tokens": [9]}}
+
+        async def aclose(self):
+            return None
+
+    def add_request_with_kv_handoff(*_args, **_kwargs):
         nonlocal handoff_called
         handoff_called = True
         raise AssertionError("health probe must not import KV")
 
-    engine = MegatronLLMEngine(_config("decode"), lambda: None)
-    engine.llm = SimpleNamespace(
-        generate_stream=generate_stream,
-        generate_stream_with_kv_handoff=generate_stream_with_kv_handoff,
+    engine = MegatronLLMEngine(_config("decode"))
+    engine.client = SimpleNamespace(
+        add_request_streaming=lambda *_args, **_kwargs: Stream(),
+        add_request_with_kv_handoff=add_request_with_kv_handoff,
     )
     request = {
         "token_ids": [1],
@@ -117,11 +97,8 @@ async def test_decode_health_probe_bypasses_kv_handoff():
 async def test_abort_uses_megatron_request_id_recorded_for_context():
     aborted = []
 
-    async def abort(request_id):
-        aborted.append(request_id)
-
-    engine = MegatronLLMEngine(_config(), lambda: None)
-    engine.llm = SimpleNamespace(abort=abort)
+    engine = MegatronLLMEngine(_config())
+    engine.client = SimpleNamespace(abort_request=aborted.append)
     engine._request_ids["dynamo-request"] = 77
 
     await engine.abort(_Context())
@@ -134,10 +111,11 @@ def test_metrics_snapshot_includes_scheduler_load():
     publisher = SimpleNamespace(
         publish=lambda rank, snapshot: published.append((rank, snapshot))
     )
-    engine = MegatronLLMEngine(_config(), lambda: None)
+    engine = MegatronLLMEngine(_config())
     engine.attach_snapshot_publisher(publisher)
 
     engine._on_metrics(
+        0,
         {
             "allocated_blocks": 25,
             "total_blocks": 100,
@@ -152,3 +130,4 @@ def test_metrics_snapshot_includes_scheduler_load():
     assert rank == 0
     assert snapshot.active_requests == 3
     assert snapshot.waiting_requests == 2
+    assert engine._rank_metrics[0]["allocated_blocks"] == 25

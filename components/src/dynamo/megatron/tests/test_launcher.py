@@ -1,33 +1,35 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 from dynamo.megatron.args import parse_args
-from dynamo.megatron.main import (
-    _logical_replica_group,
-    _torchrun_command,
-    _under_torchrun,
-)
+from dynamo.megatron.llm_engine import MegatronLLMEngine
+from dynamo.megatron.main import main
+
+
+def _argv():
+    return [
+        "--role",
+        "aggregated",
+        "--model",
+        "model-meta",
+        "--nproc-per-node",
+        "2",
+        "--",
+        "--load",
+        "/checkpoints/model",
+        "--tensor-model-parallel-size",
+        "2",
+    ]
 
 
 def test_parse_args_splits_dynamo_and_megatron_arguments():
-    config = parse_args(
-        [
-            "--role",
-            "aggregated",
-            "--model",
-            "model-meta",
-            "--nproc-per-node",
-            "2",
-            "--",
-            "--load",
-            "/checkpoints/model",
-            "--tensor-model-parallel-size",
-            "2",
-        ]
-    )
+    config = parse_args(_argv())
     assert config.component == "backend"
     assert config.nproc_per_node == 2
     assert config.megatron_argv == [
@@ -54,46 +56,56 @@ def test_disaggregated_role_requires_transfer_and_coordinator_addresses():
             ]
         )
 
-    with pytest.raises(SystemExit):
-        parse_args(
-            [
-                "--role",
-                "decode",
-                "--model",
-                "model-meta",
-                "--nproc-per-node",
-                "1",
-                "--kv-transfer-listen-addr",
-                "127.0.0.1:7000",
-                "--",
-                "--load",
-                "/checkpoint",
-            ]
-        )
+
+def test_public_entrypoint_uses_common_runner():
+    with patch("dynamo.megatron.main.run") as run:
+        main()
+    run.assert_called_once_with(MegatronLLMEngine)
 
 
-def test_torchrun_command_reexecutes_module():
-    command = _torchrun_command(["--model", "m"], 4)
+def test_owned_engine_command_targets_megatron_only_service():
+    config = parse_args(_argv())
+    engine = MegatronLLMEngine(config)
+    command = engine._engine_command(Path("/tmp/ready.json"))
+
     assert command[1:4] == ["-m", "torch.distributed.run", "--standalone"]
-    assert "--nproc-per-node=4" in command
-    assert command[-3:] == ["dynamo.megatron", "--model", "m"]
+    assert "--nproc-per-node=2" in command
+    assert "megatron.inference.dynamic_server" in command
+    assert "dynamo.megatron" not in command
+    assert command[-4:] == [
+        "--load",
+        "/checkpoints/model",
+        "--tensor-model-parallel-size",
+        "2",
+    ]
 
 
-def test_recursion_guard_accepts_internal_or_external_torchrun_env():
-    assert _under_torchrun({"DYNAMO_MEGATRON_RANK_PROCESS": "1"})
-    assert _under_torchrun({"RANK": "0", "LOCAL_RANK": "0"})
-    assert not _under_torchrun({})
+@pytest.mark.asyncio
+async def test_from_args_is_side_effect_free(monkeypatch):
+    async def fail_create_subprocess(*args, **kwargs):
+        raise AssertionError("from_args must not start a process")
+
+    monkeypatch.setattr("asyncio.create_subprocess_exec", fail_create_subprocess)
+    engine, worker = await MegatronLLMEngine.from_args(_argv())
+
+    assert engine._process is None
+    assert engine.client is None
+    assert worker.component == "backend"
+    assert worker.model_name == "model-meta"
 
 
-def test_logical_replica_group_uses_expert_dp_for_nano_ep_topology():
-    groups = SimpleNamespace(dp=object(), expt_dp=object())
+@pytest.mark.asyncio
+async def test_readiness_reports_early_child_failure(tmp_path):
+    engine = MegatronLLMEngine(parse_args(_argv()))
+    engine._process = SimpleNamespace(returncode=17)
+    with pytest.raises(RuntimeError, match="exited before readiness.*17"):
+        await engine._wait_for_readiness(tmp_path / "missing.json")
 
-    nano_args = SimpleNamespace(expert_model_parallel_size=2)
-    dense_args = SimpleNamespace(expert_model_parallel_size=1)
 
-    nano_group = _logical_replica_group(nano_args, groups)
-    group_sizes = {groups.dp: 2, groups.expt_dp: 1}
-
-    assert nano_group is groups.expt_dp
-    assert group_sizes[nano_group] == 1
-    assert _logical_replica_group(dense_args, groups) is groups.dp
+@pytest.mark.asyncio
+async def test_readiness_descriptor_is_loaded(tmp_path):
+    engine = MegatronLLMEngine(parse_args(_argv()))
+    path = tmp_path / "ready.json"
+    expected = {"coordinator_address": "tcp://127.0.0.1:5000"}
+    path.write_text(json.dumps(expected))
+    assert await engine._wait_for_readiness(path) == expected

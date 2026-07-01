@@ -161,7 +161,8 @@ attention KV and Mamba conv/SSM state layout matched rank-to-rank.
   group) and PP (layer); unlike attention KV heads there is no reshard plan for
   it yet. Hybrid + (TP>1 or PP>1) with KV transfer raises `NotImplementedError`
   at launch rather than producing wrong output. Extending to heterogeneous
-  TP/PP requires a conv/ssm reshard plan analogous to `kv_reshard_plan.py`.
+  TP/PP requires a conv/ssm reshard plan analogous to
+  `disaggregation/kv_reshard.py`.
 - Both prefill and decode must run with `--inference-dynamic-batching-prefix-caching`
   and `--inference-dynamic-batching-prefix-caching-mamba-gb`: prefill is the
   source of the block-boundary snapshots, decode restores them.

@@ -27,6 +27,8 @@ class Config:
     megatron_root: str
     drain_timeout: float
     megatron_argv: list[str]
+    engine_start_timeout: float = 1800.0
+    engine_shutdown_timeout: float = 30.0
 
 
 def _split_argv(argv: list[str]) -> tuple[list[str], list[str]]:
@@ -61,10 +63,16 @@ def parse_args(argv: list[str] | None = None) -> Config:
     parser.add_argument("--kv-transfer-listen-addr", default=None)
     parser.add_argument("--megatron-root", default="/opt/megatron-lm")
     parser.add_argument("--drain-timeout", type=float, default=30.0)
+    parser.add_argument("--engine-start-timeout", type=float, default=1800.0)
+    parser.add_argument("--engine-shutdown-timeout", type=float, default=30.0)
     args = parser.parse_args(dynamo_argv)
 
     if args.nproc_per_node < 1:
         parser.error("--nproc-per-node must be at least 1")
+    if args.engine_start_timeout <= 0:
+        parser.error("--engine-start-timeout must be positive")
+    if args.engine_shutdown_timeout <= 0:
+        parser.error("--engine-shutdown-timeout must be positive")
     if not megatron_argv:
         parser.error("Megatron arguments are required after '--'")
     if args.role in ("prefill", "decode") and not args.kv_transfer_listen_addr:
@@ -92,4 +100,6 @@ def parse_args(argv: list[str] | None = None) -> Config:
         megatron_root=args.megatron_root,
         drain_timeout=args.drain_timeout,
         megatron_argv=megatron_argv,
+        engine_start_timeout=args.engine_start_timeout,
+        engine_shutdown_timeout=args.engine_shutdown_timeout,
     )
